@@ -399,7 +399,10 @@ button{touch-action:manipulation}
   .grid-4{grid-template-columns:repeat(2,1fr);gap:12px}
   .ls-hide-sm{display:none!important}
   .ls-close-btn{display:flex!important;align-items:center;justify-content:center}
-  .rt-col{border-left:none!important;padding-left:0!important;border-top:1px solid #F3F4F6;padding-top:14px;min-width:0!important;width:100%}
+  .rt-col{border-left:none!important;padding-left:0!important;border-top:1px solid #F3F4F6;padding-top:14px;min-width:0!important;width:100%;flex:1 1 100%!important}
+  /* Dashboard rating card: stack its three sections cleanly on mobile */
+  .dash-rating{align-items:stretch!important;gap:16px!important;padding:18px 16px!important}
+  .dash-rating-head{flex:1 1 100%!important;width:100%}
   /* Comfortable tap targets on touch screens */
   button{min-height:40px}
   h1.ls-h1{font-size:22px!important}
@@ -570,6 +573,35 @@ if (typeof window !== "undefined" && "speechSynthesis" in window) {
   const warm = () => { _voiceCache = window.speechSynthesis.getVoices(); };
   warm();
   window.speechSynthesis.onvoiceschanged = warm;
+}
+
+// ── Speech recognition (shared) ───────────────────────────────────────────────
+const SR_SUPPORTED = typeof window !== "undefined" &&
+  ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
+
+// Friendly message for each recognition error code.
+function srErrorMessage(code) {
+  switch (code) {
+    case "not-allowed":
+    case "service-not-allowed": return "Microphone access is blocked. Please allow microphone permission and try again.";
+    case "audio-capture":       return "No microphone was found. Please connect a mic and try again.";
+    case "no-speech":           return "Didn't catch any speech — please try speaking again.";
+    case "network":             return "Network issue with speech recognition. Check your connection and retry.";
+    case "aborted":             return null; // user/programmatic stop — not an error to show
+    default:                    return "Speech recognition stopped unexpectedly. Please try again.";
+  }
+}
+
+// Create a configured SpeechRecognition instance, or null if unsupported.
+function createRecognition({ continuous = false, lang = "en-US" } = {}) {
+  if (!SR_SUPPORTED) return null;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const sr = new SR();
+  sr.continuous = continuous;
+  sr.interimResults = true;
+  sr.lang = lang;
+  sr.maxAlternatives = 1;
+  return sr;
 }
 
 // Pronunciation button — tap to hear the word spoken
@@ -905,7 +937,7 @@ function AuthPage({ onAuth, frozen }) {
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
-function Sidebar({ page, onNav, user, onLogout, open, isAdmin, frozen, onFreeze, onUnfreeze, onAbout }) {
+function Sidebar({ page, onNav, user, onLogout, open, isAdmin, onAbout }) {
   return (
     <aside className={`ls-sidebar${open?" open":""}`} style={{ background:P.ink,display:"flex",flexDirection:"column",height:"100vh",height:"100dvh",overflow:"hidden" }}>
       <div style={{ position:"absolute",top:-80,left:-60,width:250,height:250,borderRadius:"50%",background:"radial-gradient(circle,rgba(124,58,237,.3),transparent 70%)",pointerEvents:"none" }}/>
@@ -929,29 +961,6 @@ function Sidebar({ page, onNav, user, onLogout, open, isAdmin, frozen, onFreeze,
             </button>
           );
         })}
-
-        {/* Admin-only freeze controls — visible ONLY to the admin account */}
-        {isAdmin && (
-          <div style={{ marginTop:14,padding:"0 14px" }}>
-            <div style={{ fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:".1em",color:"rgba(245,158,11,.7)",padding:"8px 4px 10px",display:"flex",alignItems:"center",gap:6 }}>
-              🛡️ Admin Controls
-            </div>
-            <div style={{ background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"12px" }}>
-              <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:10 }}>
-                <span style={{ width:8,height:8,borderRadius:"50%",background:frozen?P.red:P.green,boxShadow:`0 0 8px ${frozen?P.red:P.green}` }}/>
-                <span style={{ fontSize:11,fontWeight:600,color:"rgba(255,255,255,.7)" }}>Site status: {frozen?"Frozen":"Live"}</span>
-              </div>
-              {frozen ? (
-                <button onClick={onUnfreeze} style={{ width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:7,padding:"9px",background:P.gradGreen,border:"none",borderRadius:9,color:"#fff",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:"inherit" }}>🔓 Unfreeze Site</button>
-              ) : (
-                <button onClick={onFreeze} style={{ width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:7,padding:"9px",background:"linear-gradient(135deg,#DC2626,#B91C1C)",border:"none",borderRadius:9,color:"#fff",fontSize:12.5,fontWeight:700,cursor:"pointer",fontFamily:"inherit" }}>🔒 Freeze Site</button>
-              )}
-              <div style={{ fontSize:10,color:"rgba(255,255,255,.35)",marginTop:9,lineHeight:1.5 }}>
-                {frozen ? "All users are locked out. You keep full access." : "Freezing locks out all users except you."}
-              </div>
-            </div>
-          </div>
-        )}
       </nav>
       <div style={{ padding:"14px 18px",borderTop:"1px solid rgba(255,255,255,.08)",position:"relative" }}>
         <div style={{ display:"flex",alignItems:"center",gap:10,marginBottom:12 }}>
@@ -1079,9 +1088,9 @@ function Dashboard({ store, onNav }) {
 
       {/* Overall rating (all activities) + confidence improvement tracker */}
       <div style={{ borderRadius:18,padding:"1.5px",background:P.gradAmber,marginBottom:18 }}>
-        <div style={{ background:"#fff",borderRadius:17,padding:"22px 24px",display:"flex",gap:24,alignItems:"center",flexWrap:"wrap" }}>
+        <div className="dash-rating" style={{ background:"#fff",borderRadius:17,padding:"22px 24px",display:"flex",gap:24,alignItems:"center",flexWrap:"wrap" }}>
           {/* Overall rating ring + stars */}
-          <div style={{ display:"flex",alignItems:"center",gap:16 }}>
+          <div className="dash-rating-head" style={{ display:"flex",alignItems:"center",gap:16,minWidth:0 }}>
             <div style={{ position:"relative" }}>
               <Ring value={avgOverall} color={P.amber} size={88}/>
               <div style={{ position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center" }}>
@@ -1126,14 +1135,19 @@ function Dashboard({ store, onNav }) {
                 </span>
               )}
             </div>
-            {confSeries.length ? (
+            {confSeries.length >= 2 ? (
               <>
                 <Spark data={confSeries} color={P.coral}/>
-                <div style={{ display:"flex",justifyContent:"space-between",marginTop:6 }}>
+                <div style={{ display:"flex",justifyContent:"space-between",gap:8,marginTop:6,flexWrap:"wrap" }}>
                   <span style={{ fontSize:11,color:P.g400 }}>Avg confidence: <b style={{ color:P.coralD }}>{avgConf}%</b></span>
                   <span style={{ fontSize:11,color:P.g400 }}>Latest: <b style={{ color:P.coralD }}>{lastConf}%</b></span>
                 </div>
               </>
+            ) : confSeries.length === 1 ? (
+              <div style={{ display:"flex",alignItems:"center",gap:12,padding:"6px 0" }}>
+                <div style={{ fontSize:26,fontWeight:800,...gText(P.gradCoral) }}>{lastConf}%</div>
+                <div style={{ fontSize:12,color:P.g500,lineHeight:1.5 }}>First session logged.<br/>Record more to see your trend.</div>
+              </div>
             ) : (
               <div style={{ fontSize:13,color:P.g400,padding:"8px 0" }}>
                 Record a speech to track your confidence over time.
@@ -1411,16 +1425,18 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
   }
 
   function startListen() {
-    if (!("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
+    if (!SR_SUPPORTED) {
       showToast("Speech recognition isn't supported in this browser","error"); return;
     }
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const sr = new SR(); srRef.current = sr;
-    sr.continuous = false; sr.interimResults = true; sr.lang = "en-US";
+    const sr = createRecognition({ continuous:false });
+    if (!sr) { showToast("Speech recognition isn't available","error"); return; }
+    srRef.current = sr;
     let finalText = "";
+    let gotResult = false;
     setListening(true); setHeard(""); setScore(null);
     startAudio(); // begin live waveform
     sr.onresult = e => {
+      gotResult = true;
       let interim = "";
       for (let i=e.resultIndex; i<e.results.length; i++) {
         if (e.results[i].isFinal) finalText += e.results[i][0].transcript + " ";
@@ -1428,14 +1444,14 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
       }
       setHeard((finalText + interim).trim());
     };
-    sr.onerror = e => {
-      setListening(false); stopAudio();
-      if (e.error === "not-allowed") showToast("Microphone access denied","error");
+    sr.onerror = ev => {
+      const msg = srErrorMessage(ev.error);
+      if (msg) showToast(msg, "error");
     };
     sr.onend = () => {
       setListening(false); stopAudio();
       const said = finalText.trim();
-      if (!said) { setScore(0); return; }
+      if (!said) { if (gotResult) setScore(0); return; }
       const sc = matchScore(sentence, said);
       setScore(sc); setHeard(said); setAttempts(a => a+1);
       if (sc >= MATCH_PASS) {
@@ -1448,9 +1464,16 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
         setStreak(0); // a miss resets the streak
       }
     };
-    try { sr.start(); } catch {}
+    try { sr.start(); }
+    catch {
+      // If it throws (e.g. called too soon after a prior stop), retry once.
+      setTimeout(() => { try { sr.start(); } catch { setListening(false); stopAudio(); } }, 250);
+    }
   }
-  function stopListen() { try { srRef.current?.stop(); } catch {} stopAudio(); setListening(false); }
+  function stopListen() {
+    if (srRef.current) { try { srRef.current.stop(); } catch {} }
+    stopAudio(); setListening(false);
+  }
 
   function save() {
     if (!sentence) return;
@@ -2281,6 +2304,8 @@ function SpeechPage({ store, onSave, showToast }) {
   const rafRef    = useRef(null);
   const transcRef = useRef("");
   const timeRef   = useRef(0);
+  const finalRef  = useRef("");      // accumulated final transcript across restarts
+  const recActiveRef = useRef(false); // true while the user is recording
 
   useEffect(() => { transcRef.current = transcript; }, [transcript]);
   useEffect(() => { timeRef.current = time; }, [time]);
@@ -2351,6 +2376,8 @@ function SpeechPage({ store, onSave, showToast }) {
 
   function startRec() {
     setRecording(true); setTime(0); setResult(null); setTranscript(""); setPolished(""); setPhase("idle"); setVol(0); setWpm(0);
+    finalRef.current = "";          // accumulated final transcript (survives restarts)
+    recActiveRef.current = true;    // we WANT recognition running
     startAudio();
     timerRef.current = setInterval(() => {
       setTime(t => {
@@ -2361,30 +2388,53 @@ function SpeechPage({ store, onSave, showToast }) {
         return newT;
       });
     }, 1000);
-    if ("webkitSpeechRecognition" in window || "SpeechRecognition" in window) {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      srRef.current = new SR(); srRef.current.continuous = true; srRef.current.interimResults = true; srRef.current.lang = "en-US";
-      let final = "";
-      srRef.current.onresult = e => {
+
+    if (!SR_SUPPORTED) {
+      setTranscript("Speech recognition isn't supported in this browser. You can type or paste your speech below for AI analysis and polishing.");
+      showToast("Live transcription unavailable — type your speech instead","error");
+      return;
+    }
+
+    const begin = () => {
+      const sr = createRecognition({ continuous:true });
+      if (!sr) return;
+      srRef.current = sr;
+      sr.onresult = e => {
         let interim = "";
         for (let i=e.resultIndex; i<e.results.length; i++) {
-          if (e.results[i].isFinal) final += e.results[i][0].transcript+" ";
+          if (e.results[i].isFinal) finalRef.current += e.results[i][0].transcript + " ";
           else interim += e.results[i][0].transcript;
         }
-        setTranscript((final+interim).trim());
+        setTranscript((finalRef.current + interim).trim());
       };
-      srRef.current.onerror = e => {
-        if (e.error==="not-allowed") showToast("Microphone access denied","error");
+      sr.onerror = ev => {
+        const msg = srErrorMessage(ev.error);
+        if (msg) showToast(msg, "error");
+        // A hard permission/capture error means we should stop trying.
+        if (ev.error === "not-allowed" || ev.error === "service-not-allowed" || ev.error === "audio-capture") {
+          recActiveRef.current = false;
+        }
       };
-      srRef.current.start();
-    } else {
-      setTranscript("Speech recognition is not available in this browser. Type or paste your speech below for AI analysis and polishing.");
-    }
+      sr.onend = () => {
+        // Mobile browsers stop recognition after pauses; auto-restart while the
+        // user is still recording so the transcript keeps building.
+        if (recActiveRef.current) {
+          try { sr.start(); } catch { /* will retry on next onend */ }
+        }
+      };
+      try { sr.start(); }
+      catch (e) {
+        // start() throws if called too soon after a previous stop; retry shortly.
+        setTimeout(() => { if (recActiveRef.current) { try { sr.start(); } catch {} } }, 250);
+      }
+    };
+    begin();
   }
 
   function stopRec() {
+    recActiveRef.current = false;   // stop the auto-restart loop
     setRecording(false); clearInterval(timerRef.current); stopAudio();
-    if (srRef.current) { try { srRef.current.stop(); } catch {} }
+    if (srRef.current) { try { srRef.current.onend = null; srRef.current.stop(); } catch {} }
     setPhase("recorded");
   }
 
@@ -2968,9 +3018,10 @@ const DATA_LABELS = {
   customNotes:"Notes", matchSentences:"Match sentences",
 };
 
-function AdminPage({ currentUser }) {
+function AdminPage({ currentUser, frozen, onFreeze, onUnfreeze }) {
   const [usage, setUsage]   = useState(() => allUsersUsage());
   const [openEmail, setOpenEmail] = useState(null);
+  const [ctrlOpen, setCtrlOpen] = useState(false); // Site Controls dropdown open/closed
   const accounts = loadAccounts();
   const nameFor = email => (accounts.find(a => a.email === email)?.name) || email;
 
@@ -2989,7 +3040,43 @@ function AdminPage({ currentUser }) {
         </div>
         <Ghost onClick={refresh} color={P.amberD} size="sm">↻ Refresh</Ghost>
       </div>
-      <p style={{ fontSize:13,color:P.g500,margin:"0 0 18px" }}>Data usage per user. As admin you can review every user's saved data; regular users can only ever see their own.</p>
+      <p style={{ fontSize:13,color:P.g500,margin:"0 0 16px" }}>Data usage per user. As admin you can review every user's saved data; regular users can only ever see their own.</p>
+
+      {/* Site Controls — dropdown with hide/display + Freeze/Unfreeze options */}
+      <PCard style={{ marginBottom:18 }}>
+        <button onClick={()=>setCtrlOpen(o=>!o)} aria-expanded={ctrlOpen}
+          style={{ width:"100%",display:"flex",alignItems:"center",gap:10,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0 }}>
+          <span style={{ width:36,height:36,borderRadius:10,background:P.gradAmber,display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,flexShrink:0 }}>⚙️</span>
+          <span style={{ flex:1,minWidth:0,textAlign:"left" }}>
+            <span style={{ display:"block",fontSize:14.5,fontWeight:700,color:P.g900 }}>Site Controls</span>
+            <span style={{ display:"flex",alignItems:"center",gap:6,fontSize:11.5,marginTop:2 }}>
+              <span style={{ width:8,height:8,borderRadius:"50%",background:frozen?P.red:P.green,display:"inline-block" }}/>
+              <span style={{ color:P.g500 }}>Status: <b style={{ color:frozen?P.red:P.greenD }}>{frozen?"Frozen":"Live"}</b></span>
+            </span>
+          </span>
+          <span style={{ fontSize:12,color:P.g400,transform:ctrlOpen?"rotate(180deg)":"none",transition:"transform .2s" }}>▼</span>
+        </button>
+        {ctrlOpen && (
+          <div style={{ marginTop:14,paddingTop:14,borderTop:`1px solid ${P.g100}`,animation:"fadeIn .2s ease" }}>
+            <SLbl color={P.amberD}>Freeze / Unfreeze the site</SLbl>
+            <p style={{ fontSize:12.5,color:P.g600,lineHeight:1.6,margin:"0 0 12px" }}>
+              {frozen
+                ? "The site is frozen — all users are locked out. You still have full access. Unfreeze to restore access for everyone."
+                : "Freezing the site locks out all users except you (the admin). Use it for maintenance or emergencies."}
+            </p>
+            <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>
+              <button onClick={onFreeze} disabled={frozen}
+                style={{ flex:"1 1 160px",display:"flex",alignItems:"center",justifyContent:"center",gap:7,padding:"11px",borderRadius:10,border:"none",fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:frozen?"not-allowed":"pointer",background:frozen?P.g200:"linear-gradient(135deg,#DC2626,#B91C1C)",color:frozen?P.g400:"#fff",boxShadow:frozen?"none":"0 4px 14px rgba(220,38,38,.3)" }}>
+                🔒 Freeze Site
+              </button>
+              <button onClick={onUnfreeze} disabled={!frozen}
+                style={{ flex:"1 1 160px",display:"flex",alignItems:"center",justifyContent:"center",gap:7,padding:"11px",borderRadius:10,border:"none",fontSize:13,fontWeight:700,fontFamily:"inherit",cursor:!frozen?"not-allowed":"pointer",background:!frozen?P.g200:P.gradGreen,color:!frozen?P.g400:"#fff",boxShadow:!frozen?"none":"0 4px 14px rgba(16,185,129,.3)" }}>
+                🔓 Unfreeze Site
+              </button>
+            </div>
+          </div>
+        )}
+      </PCard>
 
       {/* Totals */}
       <div className="grid-4" style={{ marginBottom:20 }}>
@@ -3284,7 +3371,7 @@ export default function App() {
     talks:     <TalksPage store={store} onSave={handleSave} showToast={showToast}/>,
     library:   <LibraryPage store={store} onSave={handleSave} onNav={navTo} showToast={showToast}/>,
     // Admin Panel is gated: non-admins are bounced to their dashboard.
-    admin:     isAdmin ? <AdminPage currentUser={user}/> : <Dashboard store={store} onNav={navTo}/>,
+    admin:     isAdmin ? <AdminPage currentUser={user} frozen={frozen} onFreeze={freezeSite} onUnfreeze={unfreezeSite}/> : <Dashboard store={store} onNav={navTo}/>,
   };
   const pageLabel = (NAV.find(n=>n.id===page)||{}).label || "LeadSpeak";
 
@@ -3294,7 +3381,7 @@ export default function App() {
         {/* Off-canvas scrim (mobile only) */}
         <div className={`ls-scrim${navOpen?" open":""}`} onClick={()=>setNavOpen(false)}/>
         <Sidebar page={page} onNav={navTo} user={user} onLogout={handleLogout} open={navOpen}
-                 isAdmin={isAdmin} frozen={frozen} onFreeze={freezeSite} onUnfreeze={unfreezeSite}
+                 isAdmin={isAdmin}
                  onAbout={()=>{ setAboutOpen(true); setNavOpen(false); }}/>
         <div className="ls-content" style={{ flex:1,display:"flex",flexDirection:"column",minWidth:0 }}>
           {/* Mobile topbar with hamburger */}
