@@ -1,5 +1,18 @@
 import { useState, useRef, useEffect } from "react";
 
+// Ensure mobile/tablet browsers scale correctly. This runs at module load —
+// BEFORE the first render — so the very first paint is already correctly scaled.
+// (Setting the viewport only in a post-mount effect is too late and causes the
+// page to render at desktop width first, which looks broken on phones.)
+(function ensureViewport() {
+  try {
+    if (typeof document === "undefined") return;
+    let meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) { meta = document.createElement("meta"); meta.setAttribute("name","viewport"); document.head.appendChild(meta); }
+    meta.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover");
+  } catch {}
+})();
+
 // ── Palette ───────────────────────────────────────────────────────────────────
 const P = {
   ink:"#0A0520",inkMid:"#150D3A",
@@ -131,12 +144,88 @@ const NAV = [
   { id:"match",     label:"Speak & Match",    icon:"🗣️" },
   { id:"talks",     label:"Famous Talks",     icon:"🎤" },
   { id:"library",   label:"My Library",       icon:"🔖" },
+  { id:"admin",     label:"Admin Panel",      icon:"🛡️", adminOnly:true },
 ];
 
 // ── Storage ───────────────────────────────────────────────────────────────────
-const SK = "leadspeak_v4";
-const loadStore = () => { try { return JSON.parse(localStorage.getItem(SK)||"{}"); } catch { return {}; } };
-const saveStore = d => { try { localStorage.setItem(SK, JSON.stringify(d)); } catch {} };
+// Data is namespaced PER USER so one user can never see another user's saved data.
+// Layout in localStorage:
+//   leadspeak_users : { "<email>": { savedTopics:[], savedVocab:[], ... }, ... }
+//   leadspeak_session (or sessionStorage) : the logged-in user object
+// Remember Me decides whether the session is written to localStorage (persists
+// across browser restarts) or sessionStorage (cleared when the tab closes).
+
+const USERS_KEY  = "leadspeak_users_v1";
+const SESS_KEY   = "leadspeak_session_v1";
+const REMEMBER_KEY = "leadspeak_remember";
+
+const EMPTY_USER_DATA = { savedTopics:[], savedSentences:[], savedVocab:[], savedTalks:[], savedSpeeches:[], customTalks:[], customNotes:[], matchSentences:[] };
+const DATA_KEYS = Object.keys(EMPTY_USER_DATA);
+
+const _readUsers = () => { try { return JSON.parse(localStorage.getItem(USERS_KEY) || "{}"); } catch { return {}; } };
+const _writeUsers = m => { try { localStorage.setItem(USERS_KEY, JSON.stringify(m)); } catch {} };
+
+// Load a single user's saved data (by email). Returns a fresh empty set if none.
+function loadUserData(email) {
+  if (!email) return { ...EMPTY_USER_DATA };
+  const all = _readUsers();
+  return { ...EMPTY_USER_DATA, ...(all[(email||"").trim().toLowerCase()] || {}) };
+}
+// Persist a single user's saved data (by email), keeping only the data keys.
+function saveUserData(email, data) {
+  if (!email) return;
+  const em = (email||"").trim().toLowerCase();
+  const all = _readUsers();
+  const clean = {}; DATA_KEYS.forEach(k => { clean[k] = data[k] || []; });
+  all[em] = clean;
+  _writeUsers(all);
+}
+
+// Byte size of a user's stored data (for the admin usage tracker).
+function userDataBytes(data) {
+  try { return new Blob([JSON.stringify(data || {})]).size; }
+  catch { return JSON.stringify(data || {}).length; }
+}
+// Summary of every user's data usage — admin only.
+function allUsersUsage() {
+  const all = _readUsers();
+  return Object.entries(all).map(([email, data]) => {
+    const counts = {}; DATA_KEYS.forEach(k => counts[k] = (data[k] || []).length);
+    const items = Object.values(counts).reduce((a,b)=>a+b, 0);
+    return { email, bytes: userDataBytes(data), items, counts };
+  }).sort((a,b) => b.bytes - a.bytes);
+}
+
+// Session helpers — Remember Me gates localStorage vs sessionStorage.
+const isRemembered = () => { try { return localStorage.getItem(REMEMBER_KEY) === "1"; } catch { return false; } };
+function loadSession() {
+  try {
+    const raw = (isRemembered() ? localStorage.getItem(SESS_KEY) : null)
+             || (typeof sessionStorage !== "undefined" ? sessionStorage.getItem(SESS_KEY) : null);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function saveSession(user, remember) {
+  try {
+    const json = JSON.stringify(user);
+    if (remember) {
+      localStorage.setItem(REMEMBER_KEY, "1");
+      localStorage.setItem(SESS_KEY, json);
+      if (user.email) localStorage.setItem("leadspeak_remember_email", user.email);
+      try { sessionStorage.setItem(SESS_KEY, json); } catch {}
+    } else {
+      localStorage.removeItem(REMEMBER_KEY);
+      localStorage.removeItem(SESS_KEY);
+      localStorage.removeItem("leadspeak_remember_email");
+      try { sessionStorage.setItem(SESS_KEY, json); } catch {}
+    }
+  } catch {}
+}
+function clearSession() {
+  try { localStorage.removeItem(SESS_KEY); } catch {}
+  try { sessionStorage.removeItem(SESS_KEY); } catch {}
+  // Note: we keep the remembered email so the login field can prefill it.
+}
 
 // ── Accounts (credential store) ───────────────────────────────────────────────
 // Frontend-only artifact: accounts live in localStorage. Passwords are never
@@ -262,11 +351,15 @@ button:focus-visible{outline:2px solid #7C3AED;outline-offset:2px}
 .finput.ok{border-color:#10B981;box-shadow:0 0 0 3px rgba(16,185,129,.08)}
 .finput.err{border-color:#EF4444;box-shadow:0 0 0 4px rgba(239,68,68,.1)}
 
-/* ── Responsive layout system ── */
+/* ── Responsive layout system (laptop / tablet / mobile) ── */
 *{max-width:100%}
-html,body{overflow-x:hidden;width:100%}
-.ls-shell{display:flex;height:100vh;height:100dvh;background:#F5F3FF;overflow:hidden}
-.ls-main{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:28px;background:#F5F3FF}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+html,body{overflow-x:hidden;width:100%;max-width:100vw}
+#root,#root>div{max-width:100vw}
+.ls-shell{display:flex;height:100vh;height:100dvh;min-height:100vh;min-height:100dvh;background:#F5F3FF;overflow:hidden}
+.ls-sidebar{width:230px;min-width:230px;flex-shrink:0;position:relative}
+.ls-main{flex:1;min-width:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:28px;background:#F5F3FF}
+.ls-content{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
 .ls-topbar{display:none}
 .ls-scrim{display:none}
 .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
@@ -276,41 +369,60 @@ html,body{overflow-x:hidden;width:100%}
 img,svg,video{max-width:100%;height:auto}
 textarea,input,select{max-width:100%}
 button{touch-action:manipulation}
-@media (max-width:960px){
-  .grid-4{grid-template-columns:repeat(2,1fr);gap:12px}
+
+/* Large laptops / desktops: full layout (default above). */
+
+/* Small laptops & large tablets in landscape (1024px and below):
+   keep the sidebar but tighten spacing and collapse 4-col grids to 2-col. */
+@media (max-width:1024px){
+  .ls-sidebar{width:210px;min-width:210px}
+  .ls-main{padding:24px}
+  .grid-4{grid-template-columns:repeat(2,1fr);gap:14px}
 }
-@media (max-width:860px){
-  .grid-4{grid-template-columns:repeat(2,1fr);gap:10px}
-  .grid-2,.grid-2-sm{grid-template-columns:1fr;gap:14px}
+
+/* Tablets (portrait) — 768px to 1024px handled above; below 900px also
+   stack the two-column panels so nothing is cramped. */
+@media (max-width:900px){
+  .grid-2,.grid-2-sm{grid-template-columns:1fr;gap:16px}
 }
-@media (max-width:760px){
-  /* Sidebar becomes an off-canvas drawer */
-  .ls-shell{position:relative}
-  .ls-sidebar{position:fixed;top:0;left:0;bottom:0;z-index:60;transform:translateX(-100%);transition:transform .28s ease;box-shadow:0 0 40px rgba(0,0,0,.3)}
+
+/* Phones & small tablets (≤768px): sidebar becomes an off-canvas drawer. */
+@media (max-width:768px){
+  .ls-shell{position:relative;height:100dvh}
+  .ls-sidebar{position:fixed;top:0;left:0;bottom:0;width:78vw;max-width:300px;min-width:0;z-index:60;transform:translateX(-100%);transition:transform .28s ease;box-shadow:0 0 40px rgba(0,0,0,.3)}
   .ls-sidebar.open{transform:translateX(0)}
   .ls-scrim{display:block;position:fixed;inset:0;background:rgba(10,5,32,.45);z-index:55;opacity:0;pointer-events:none;transition:opacity .25s}
   .ls-scrim.open{opacity:1;pointer-events:auto}
-  .ls-topbar{display:flex;align-items:center;gap:12px;padding:12px 16px;background:#0A0520;position:sticky;top:0;z-index:40}
-  .ls-main{padding:16px;height:calc(100dvh - 62px)}
+  .ls-topbar{display:flex;align-items:center;gap:12px;padding:10px 14px;background:#0A0520;position:sticky;top:0;z-index:40;flex-shrink:0;min-height:56px}
+  .ls-content{height:100dvh}
+  .ls-main{flex:1;padding:16px}
+  .grid-4{grid-template-columns:repeat(2,1fr);gap:12px}
   .ls-hide-sm{display:none!important}
   .ls-close-btn{display:flex!important;align-items:center;justify-content:center}
   .rt-col{border-left:none!important;padding-left:0!important;border-top:1px solid #F3F4F6;padding-top:14px;min-width:0!important;width:100%}
-  /* Buttons get comfortable tap targets on touch screens */
+  /* Comfortable tap targets on touch screens */
   button{min-height:40px}
+  h1.ls-h1{font-size:22px!important}
 }
+
+/* Small phones (≤520px). */
 @media (max-width:520px){
   .grid-4{grid-template-columns:1fr 1fr;gap:8px}
-  .ls-main{padding:12px}
+  .ls-main{padding:13px}
   h1.ls-h1{font-size:21px!important}
   .ls-auth-card{padding:26px 18px!important;border-radius:20px!important}
   .talk-head{flex-wrap:wrap}
   .talk-title-btn{flex:1 1 100%!important}
   .talk-controls{width:100%;justify-content:flex-end}
 }
+
+/* Very small phones (≤380px). */
 @media (max-width:380px){
   .grid-4{grid-template-columns:1fr 1fr;gap:6px}
+  .ls-main{padding:11px}
   h1.ls-h1{font-size:19px!important}
 }
+
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
 }
@@ -561,17 +673,15 @@ function AuthPage({ onAuth, frozen }) {
   const [busy, setBusy] = useState(false);
   const [authErr, setAuthErr] = useState("");
   const [remember, setRemember] = useState(() => {
-    try { return localStorage.getItem("leadspeak_remember") === "1"; } catch { return false; }
+    try { return localStorage.getItem(REMEMBER_KEY) === "1"; } catch { return false; }
   });
   const [resetSent, setResetSent] = useState(false);
 
   // Prefill the remembered email so "Remember me" actually remembers something.
   useEffect(() => {
     try {
-      if (localStorage.getItem("leadspeak_remember") === "1") {
-        const e = localStorage.getItem("leadspeak_remember_email") || "";
-        if (e) setForm(f => ({ ...f, email:e }));
-      }
+      const e = localStorage.getItem("leadspeak_remember_email") || "";
+      if (e) setForm(f => ({ ...f, email:e }));
     } catch {}
   }, []);
 
@@ -592,13 +702,14 @@ function AuthPage({ onAuth, frozen }) {
     return vs.name.ok===true && vs.email.ok===true && vs.password.ok===true && vs.confirm.ok===true;
   };
 
-  function persistRemember(email) {
+  function persistRememberEmail(email) {
+    // Only manages the prefill email + remember flag; session persistence is
+    // handled by the parent via saveSession(user, remember).
     try {
       if (remember) {
-        localStorage.setItem("leadspeak_remember", "1");
+        localStorage.setItem(REMEMBER_KEY, "1");
         localStorage.setItem("leadspeak_remember_email", normEmail(email));
       } else {
-        localStorage.removeItem("leadspeak_remember");
         localStorage.removeItem("leadspeak_remember_email");
       }
     } catch {}
@@ -615,8 +726,8 @@ function AuthPage({ onAuth, frozen }) {
       // Create a real account; reject duplicate emails.
       const res = await registerAccount({ name:form.name, email:form.email, password:form.password });
       if (!res.ok) { setAuthErr(res.error); setBusy(false); return; }
-      persistRemember(form.email);
-      onAuth(res.user);
+      persistRememberEmail(form.email);
+      onAuth(res.user, remember);
       setBusy(false);
       return;
     }
@@ -624,8 +735,8 @@ function AuthPage({ onAuth, frozen }) {
     // Login: strictly verify the email exists AND the password matches.
     const res = await verifyLogin({ email:form.email, password:form.password });
     if (!res.ok) { setAuthErr(res.error); setBusy(false); return; }
-    persistRemember(form.email);
-    onAuth(res.user);
+    persistRememberEmail(form.email);
+    onAuth(res.user, remember);
     setBusy(false);
   }
 
@@ -653,7 +764,7 @@ function AuthPage({ onAuth, frozen }) {
   const pw = vs.password;
 
   return (
-    <div style={{ minHeight:"100vh",minHeight:"100dvh",background:"linear-gradient(145deg,#0A0520,#150D3A,#1E0A4A)",display:"flex",alignItems:"center",justifyContent:"center",padding:20,position:"relative",overflow:"hidden" }}>
+    <div style={{ minHeight:"100vh",minHeight:"100dvh",background:"linear-gradient(145deg,#0A0520,#150D3A,#1E0A4A)",display:"flex",alignItems:"center",justifyContent:"center",padding:"24px 20px",position:"relative",overflowX:"hidden",overflowY:"auto" }}>
       {/* Animated orbs */}
       {[["−10%","5%",300,P.purple,6],["-5%","72%",180,P.pink,9],["76%","-5%",240,P.teal,7],["80%","76%",160,P.amber,8]].map(([l,t,sz,c,d],i) => (
         <div key={i} style={{ position:"fixed",left:l,top:t,width:sz,height:sz,borderRadius:"50%",background:`radial-gradient(circle,${c}55,transparent 70%)`,animation:`orb ${d}s ease-in-out infinite alternate`,pointerEvents:"none" }}/>
@@ -749,15 +860,15 @@ function AuthPage({ onAuth, frozen }) {
 
           {/* Remember me + Forgot password (login only) */}
           {mode==="login" && (
-            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,marginTop:4 }}>
-              <label style={{ display:"flex",alignItems:"center",gap:8,cursor:"pointer",userSelect:"none" }}>
-                <button type="button" role="checkbox" aria-checked={remember} onClick={()=>setRemember(r=>!r)}
-                  style={{ width:18,height:18,borderRadius:5,border:`1.5px solid ${remember?P.purple:P.g300}`,background:remember?P.gradPurple:"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",padding:0,flexShrink:0,transition:"all .15s" }}>
+            <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,marginBottom:20,marginTop:4 }}>
+              <label style={{ display:"inline-flex",alignItems:"center",gap:9,cursor:"pointer",userSelect:"none",lineHeight:1 }}>
+                <button type="button" role="checkbox" aria-checked={remember} aria-label="Remember me" onClick={()=>setRemember(r=>!r)}
+                  style={{ width:18,height:18,minHeight:18,maxHeight:18,boxSizing:"border-box",borderRadius:5,border:`1.5px solid ${remember?P.purple:P.g300}`,background:remember?P.gradPurple:"#fff",cursor:"pointer",display:"inline-flex",alignItems:"center",justifyContent:"center",padding:0,flexShrink:0,lineHeight:0,transition:"all .15s" }}>
                   {remember && <span style={{ color:"#fff",fontSize:11,fontWeight:800,lineHeight:1 }}>✓</span>}
                 </button>
                 <span style={{ fontSize:12.5,color:P.g600,fontWeight:500 }}>Remember me</span>
               </label>
-              <button type="button" onClick={()=>goMode("forgot")} style={{ background:"none",border:"none",cursor:"pointer",fontSize:12.5,fontWeight:700,padding:0,fontFamily:"inherit",...gText(P.gradPurple) }}>Forgot password?</button>
+              <button type="button" onClick={()=>goMode("forgot")} style={{ background:"none",border:"none",cursor:"pointer",fontSize:12.5,fontWeight:700,padding:0,minHeight:0,fontFamily:"inherit",whiteSpace:"nowrap",...gText(P.gradPurple) }}>Forgot password?</button>
             </div>
           )}
 
@@ -796,7 +907,7 @@ function AuthPage({ onAuth, frozen }) {
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 function Sidebar({ page, onNav, user, onLogout, open, isAdmin, frozen, onFreeze, onUnfreeze, onAbout }) {
   return (
-    <aside className={`ls-sidebar${open?" open":""}`} style={{ width:230,minWidth:230,background:P.ink,display:"flex",flexDirection:"column",height:"100vh",height:"100dvh",overflow:"hidden",position:"relative" }}>
+    <aside className={`ls-sidebar${open?" open":""}`} style={{ background:P.ink,display:"flex",flexDirection:"column",height:"100vh",height:"100dvh",overflow:"hidden" }}>
       <div style={{ position:"absolute",top:-80,left:-60,width:250,height:250,borderRadius:"50%",background:"radial-gradient(circle,rgba(124,58,237,.3),transparent 70%)",pointerEvents:"none" }}/>
       <div style={{ padding:"22px 18px 16px",borderBottom:"1px solid rgba(255,255,255,.08)",position:"relative" }}>
         <div style={{ display:"flex",alignItems:"center",gap:10 }}>
@@ -808,7 +919,7 @@ function Sidebar({ page, onNav, user, onLogout, open, isAdmin, frozen, onFreeze,
       </div>
       <nav style={{ flex:1,padding:"12px 0",overflowY:"auto",position:"relative" }}>
         <div style={{ fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:".1em",color:"rgba(255,255,255,.25)",padding:"8px 18px 10px" }}>Navigation</div>
-        {NAV.map(n => {
+        {NAV.filter(n => !n.adminOnly || isAdmin).map(n => {
           const active = page === n.id;
           return (
             <button key={n.id} onClick={() => onNav(n.id)} style={{ display:"flex",alignItems:"center",gap:10,width:"100%",padding:"10px 18px",background:active?"rgba(124,58,237,.25)":"transparent",color:active?"#fff":"rgba(255,255,255,.5)",fontWeight:active?600:400,fontSize:13,border:"none",cursor:"pointer",textAlign:"left",borderLeft:`3px solid ${active?"#7C3AED":"transparent"}`,transition:"all .15s",fontFamily:"inherit",position:"relative" }}>
@@ -2847,6 +2958,138 @@ function LibraryPage({ store, onSave, onNav, showToast }) {
   );
 }
 
+// ── Admin Panel (admin only) ──────────────────────────────────────────────────
+// Shows per-user data usage and lets the admin inspect any user's saved data.
+// Regular users never reach this page (it's filtered from their nav and gated
+// in the router), so this is purely an admin oversight view.
+const DATA_LABELS = {
+  savedTopics:"Topics", savedSentences:"Sentences", savedVocab:"Vocabulary",
+  savedTalks:"Talks", savedSpeeches:"Speeches", customTalks:"Custom talks",
+  customNotes:"Notes", matchSentences:"Match sentences",
+};
+
+function AdminPage({ currentUser }) {
+  const [usage, setUsage]   = useState(() => allUsersUsage());
+  const [openEmail, setOpenEmail] = useState(null);
+  const accounts = loadAccounts();
+  const nameFor = email => (accounts.find(a => a.email === email)?.name) || email;
+
+  const fmtBytes = b => b < 1024 ? `${b} B` : b < 1024*1024 ? `${(b/1024).toFixed(1)} KB` : `${(b/1024/1024).toFixed(2)} MB`;
+  const totalBytes = usage.reduce((a,u)=>a+u.bytes, 0);
+  const totalItems = usage.reduce((a,u)=>a+u.items, 0);
+  const maxBytes = Math.max(1, ...usage.map(u=>u.bytes));
+  const refresh = () => setUsage(allUsersUsage());
+
+  return (
+    <div>
+      <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap",marginBottom:6 }}>
+        <div style={{ display:"flex",alignItems:"center",gap:10 }}>
+          <span style={{ fontSize:22 }}>🛡️</span>
+          <h1 className="ls-h1" style={{ fontSize:24,fontWeight:800,fontFamily:"'Plus Jakarta Sans',sans-serif",letterSpacing:"-0.02em",margin:0,...gText(P.gradAmber) }}>Admin Panel</h1>
+        </div>
+        <Ghost onClick={refresh} color={P.amberD} size="sm">↻ Refresh</Ghost>
+      </div>
+      <p style={{ fontSize:13,color:P.g500,margin:"0 0 18px" }}>Data usage per user. As admin you can review every user's saved data; regular users can only ever see their own.</p>
+
+      {/* Totals */}
+      <div className="grid-4" style={{ marginBottom:20 }}>
+        {[
+          {l:"Users",v:usage.length,g:P.gradPurple,icon:"👥"},
+          {l:"Total Items",v:totalItems,g:P.gradTeal,icon:"🗂"},
+          {l:"Total Storage",v:fmtBytes(totalBytes),g:P.gradAmber,icon:"💾"},
+          {l:"Accounts",v:accounts.length,g:P.gradPink,icon:"🔑"},
+        ].map(x => (
+          <div key={x.l} style={{ borderRadius:16,padding:"1.5px",background:x.g }}>
+            <div style={{ background:"#fff",borderRadius:15,padding:"14px 16px" }}>
+              <div style={{ fontSize:20,marginBottom:4 }}>{x.icon}</div>
+              <div style={{ fontSize:22,fontWeight:800,...gText(x.g) }}>{x.v}</div>
+              <div style={{ fontSize:11,color:P.g500,marginTop:2,fontWeight:500 }}>{x.l}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Per-user usage list */}
+      <PCard>
+        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
+          <div style={{ fontSize:15,fontWeight:700,...gText(P.gradAmber) }}>📊 Data Usage by User</div>
+          <span style={{ fontSize:11,color:P.g400 }}>Tap a user to view their saved data</span>
+        </div>
+
+        {usage.length === 0 && (
+          <div style={{ fontSize:13,color:P.g400,padding:"14px 0" }}>No user data saved yet.</div>
+        )}
+
+        {usage.map(u => {
+          const isOpen = openEmail === u.email;
+          const isMe = u.email === (currentUser?.email||"").toLowerCase();
+          const isAdm = isAdminEmail(u.email);
+          const data = loadUserData(u.email);
+          return (
+            <div key={u.email} style={{ borderBottom:`1px solid ${P.g100}` }}>
+              <div style={{ display:"flex",alignItems:"center",gap:10,padding:"12px 0" }}>
+                <button onClick={()=>setOpenEmail(isOpen?null:u.email)} style={{ flex:1,minWidth:0,display:"flex",alignItems:"center",gap:11,background:"none",border:"none",cursor:"pointer",textAlign:"left",fontFamily:"inherit",padding:0 }}>
+                  <span style={{ display:"inline-block",transform:isOpen?"rotate(90deg)":"none",transition:"transform .2s",color:P.amber,fontSize:12,flexShrink:0 }}>▶</span>
+                  <span style={{ width:34,height:34,borderRadius:"50%",background:isAdm?P.gradAmber:P.gradPink,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#fff",flexShrink:0 }}>{nameFor(u.email).split(" ").map(w=>w[0]).join("").slice(0,2).toUpperCase()}</span>
+                  <span style={{ flex:1,minWidth:0 }}>
+                    <span style={{ display:"flex",alignItems:"center",gap:6,fontSize:13.5,fontWeight:700,color:P.g900 }}>
+                      <span style={{ whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{nameFor(u.email)}</span>
+                      {isAdm && <span style={{ fontSize:8,fontWeight:800,color:"#fff",background:P.gradAmber,padding:"1px 6px",borderRadius:10,flexShrink:0 }}>ADMIN</span>}
+                      {isMe && <span style={{ fontSize:8,fontWeight:800,color:P.purpleD,background:P.purple10,padding:"1px 6px",borderRadius:10,flexShrink:0 }}>YOU</span>}
+                    </span>
+                    <span style={{ display:"block",fontSize:11,color:P.g400,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{u.email}</span>
+                  </span>
+                  <span style={{ textAlign:"right",flexShrink:0 }}>
+                    <span style={{ display:"block",fontSize:13,fontWeight:800,color:P.amberD }}>{fmtBytes(u.bytes)}</span>
+                    <span style={{ display:"block",fontSize:10,color:P.g400 }}>{u.items} item{u.items===1?"":"s"}</span>
+                  </span>
+                </button>
+              </div>
+              {/* Usage bar */}
+              <div style={{ height:5,background:P.g100,borderRadius:3,overflow:"hidden",marginBottom:10,marginLeft:23 }}>
+                <div style={{ height:"100%",width:`${(u.bytes/maxBytes)*100}%`,background:P.gradAmber,borderRadius:3,transition:"width .4s" }}/>
+              </div>
+              {isOpen && (
+                <div style={{ padding:"2px 0 16px 23px",animation:"fadeIn .25s ease" }}>
+                  {/* Category counts */}
+                  <div style={{ display:"flex",flexWrap:"wrap",gap:"6px 16px",marginBottom:14 }}>
+                    {DATA_KEYS.map(k => (
+                      <span key={k} style={{ display:"inline-flex",alignItems:"center",gap:6,fontSize:12 }}>
+                        <span style={{ color:P.g500 }}>{DATA_LABELS[k]||k}</span>
+                        <b style={{ color:u.counts[k]?P.g800:P.g300 }}>{u.counts[k]||0}</b>
+                      </span>
+                    ))}
+                  </div>
+                  {/* Actual saved data preview */}
+                  {u.items === 0 ? (
+                    <div style={{ fontSize:12.5,color:P.g400 }}>This user hasn't saved any data yet.</div>
+                  ) : (
+                    DATA_KEYS.filter(k => (data[k]||[]).length).map(k => (
+                      <div key={k} style={{ marginBottom:12 }}>
+                        <SLbl color={P.amberD}>{DATA_LABELS[k]||k} ({data[k].length})</SLbl>
+                        {data[k].slice(0,8).map((item,i) => (
+                          <div key={i} style={{ fontSize:12.5,color:P.g700,padding:"5px 0",borderBottom:`1px solid ${P.g100}`,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>
+                            • {item.title || item.word || item.text || item.original || item.transcript || item.speaker || "(untitled)"}
+                          </div>
+                        ))}
+                        {data[k].length > 8 && <div style={{ fontSize:11,color:P.g400,paddingTop:5 }}>+ {data[k].length-8} more…</div>}
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </PCard>
+
+      <p style={{ fontSize:11.5,color:P.g400,lineHeight:1.6,margin:"16px 2px 0" }}>
+        Note: this build stores data locally in the browser, so this panel reflects users who have signed in and saved data on this device. A production deployment would aggregate usage from a backend database across all devices.
+      </p>
+    </div>
+  );
+}
+
 // ── About modal ───────────────────────────────────────────────────────────────
 // Everyone sees the purpose + a high-level feature summary. Only the admin sees
 // the full technical implementation details.
@@ -2962,9 +3205,10 @@ function AboutModal({ onClose, isAdmin }) {
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [user,  setUser]  = useState(() => { const s = loadStore(); return s.user||null; });
+  const [user,  setUser]  = useState(() => loadSession());
   const [page,  setPage]  = useState("dashboard");
-  const [store, setStore] = useState(() => { const s = loadStore(); return { savedTopics:[],savedSentences:[],savedVocab:[],savedTalks:[],savedSpeeches:[],customTalks:[],customNotes:[],matchSentences:[],...s }; });
+  // Per-user data — loaded for whoever is currently logged in.
+  const [store, setStore] = useState(() => { const s = loadSession(); return loadUserData(s?.email); });
   const [toast, setToast] = useState(null);
   const [navOpen, setNavOpen] = useState(false);
   const [frozen, setFrozen] = useState(() => isSiteFrozen());
@@ -2982,17 +3226,36 @@ export default function App() {
     return () => window.removeEventListener?.("storage", onStorage);
   }, []);
 
-  // Ensure mobile browsers scale correctly (artifacts may not include a viewport meta)
+  // Reaffirm the viewport meta after mount as a safety net (it's primarily set
+  // synchronously at module load above, before first paint).
   useEffect(() => {
-    let meta = document.querySelector('meta[name="viewport"]');
-    if (!meta) { meta = document.createElement("meta"); meta.name = "viewport"; document.head.appendChild(meta); }
-    meta.content = "width=device-width, initial-scale=1, viewport-fit=cover";
+    try {
+      let meta = document.querySelector('meta[name="viewport"]');
+      if (!meta) { meta = document.createElement("meta"); meta.setAttribute("name","viewport"); document.head.appendChild(meta); }
+      meta.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover");
+    } catch {}
   }, []);
 
   const showToast = (msg, type="ok") => { setToast({msg,type}); setTimeout(()=>setToast(null),2800); };
-  const handleSave = (k,v) => { const n = {...store,[k]:v}; setStore(n); saveStore({...n,user}); };
-  const handleAuth = u => { setUser(u); saveStore({...store,user:u}); showToast(`Welcome, ${u.name.split(" ")[0]}! 🎉`); setPage("dashboard"); };
-  const handleLogout = () => { setUser(null); saveStore({...store,user:null}); setPage("dashboard"); setNavOpen(false); };
+  // Save writes ONLY to the current user's namespace — never shared.
+  const handleSave = (k,v) => {
+    const n = {...store,[k]:v};
+    setStore(n);
+    if (user?.email) saveUserData(user.email, n);
+  };
+  const handleAuth = (u, remember) => {
+    setUser(u);
+    saveSession(u, !!remember);              // Remember Me decides persistence
+    setStore(loadUserData(u.email));         // load THIS user's data only
+    showToast(`Welcome, ${u.name.split(" ")[0]}! 🎉`);
+    setPage("dashboard");
+  };
+  const handleLogout = () => {
+    clearSession();
+    setUser(null);
+    setStore({ ...EMPTY_USER_DATA });
+    setPage("dashboard"); setNavOpen(false);
+  };
   const navTo = p => { setPage(p); setNavOpen(false); };
 
   const freezeSite = () => { setSiteFrozen(true); setFrozen(true); showToast("🔒 Site frozen — all non-admin users are locked out"); };
@@ -3020,6 +3283,8 @@ export default function App() {
     match:     <SpeakMatchPage store={store} onSave={handleSave} showToast={showToast}/>,
     talks:     <TalksPage store={store} onSave={handleSave} showToast={showToast}/>,
     library:   <LibraryPage store={store} onSave={handleSave} onNav={navTo} showToast={showToast}/>,
+    // Admin Panel is gated: non-admins are bounced to their dashboard.
+    admin:     isAdmin ? <AdminPage currentUser={user}/> : <Dashboard store={store} onNav={navTo}/>,
   };
   const pageLabel = (NAV.find(n=>n.id===page)||{}).label || "LeadSpeak";
 
@@ -3031,7 +3296,7 @@ export default function App() {
         <Sidebar page={page} onNav={navTo} user={user} onLogout={handleLogout} open={navOpen}
                  isAdmin={isAdmin} frozen={frozen} onFreeze={freezeSite} onUnfreeze={unfreezeSite}
                  onAbout={()=>{ setAboutOpen(true); setNavOpen(false); }}/>
-        <div style={{ flex:1,display:"flex",flexDirection:"column",minWidth:0 }}>
+        <div className="ls-content" style={{ flex:1,display:"flex",flexDirection:"column",minWidth:0 }}>
           {/* Mobile topbar with hamburger */}
           <div className="ls-topbar">
             <button onClick={()=>setNavOpen(true)} aria-label="Open menu" style={{ width:38,height:38,borderRadius:10,border:"none",background:"rgba(255,255,255,.12)",color:"#fff",fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center" }}>☰</button>
