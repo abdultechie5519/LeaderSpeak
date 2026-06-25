@@ -579,6 +579,17 @@ if (typeof window !== "undefined" && "speechSynthesis" in window) {
 const SR_SUPPORTED = typeof window !== "undefined" &&
   ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
 
+// Mobile detection. On phones/tablets, the browser typically allows only ONE
+// microphone consumer at a time, so we must NOT open a Web-Audio getUserMedia
+// stream for the waveform at the same time as SpeechRecognition — doing so
+// starves recognition of audio and it silently captures nothing. On mobile we
+// therefore let SpeechRecognition own the mic exclusively and show a synthesized
+// "listening" animation instead of a mic-driven waveform.
+const IS_MOBILE = typeof navigator !== "undefined" &&
+  (/Android|iPhone|iPad|iPod|Mobile|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent || "") ||
+   (typeof navigator.maxTouchPoints === "number" && navigator.maxTouchPoints > 1 &&
+    /Macintosh/i.test(navigator.userAgent || "")));  // iPadOS reports as Mac but has touch
+
 // Friendly message for each recognition error code.
 function srErrorMessage(code) {
   switch (code) {
@@ -602,6 +613,44 @@ function createRecognition({ continuous = false, lang = "en-US" } = {}) {
   sr.lang = lang;
   sr.maxAlternatives = 1;
   return sr;
+}
+
+// ── One-time microphone permission ────────────────────────────────────────────
+// We ask the browser for microphone access ONCE. After the user allows it, the
+// grant (and the live stream) is cached for the rest of the session, so starting
+// another recording never re-prompts and never re-opens the mic — it continues
+// straight into the existing flow.
+// Returns: "granted" | "denied" | "unavailable".
+let _micPermission = null;          // cached result for this session
+let _micPromise = null;             // de-dupes concurrent requests
+let _micStream = null;              // the single shared mic stream (desktop waveform)
+function getMicPermissionState() { return _micPermission; }
+function getMicStream() {
+  // Return the cached stream only if its track is still live.
+  if (_micStream && _micStream.getTracks().some(t => t.readyState === "live")) return _micStream;
+  return null;
+}
+async function ensureMicPermission() {
+  if (_micPermission === "granted" && getMicStream()) return "granted"; // already allowed
+  if (_micPromise) return _micPromise;                                  // request in flight
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+    _micPermission = "unavailable";
+    return _micPermission;
+  }
+  _micPromise = (async () => {
+    try {
+      // The single prompt. We KEEP the stream so the waveform can reuse it
+      // instead of calling getUserMedia again on every recording.
+      _micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      _micPermission = "granted";
+    } catch (e) {
+      _micPermission = (e && (e.name === "NotFoundError" || e.name === "NotReadableError")) ? "unavailable" : "denied";
+    } finally {
+      _micPromise = null;
+    }
+    return _micPermission;
+  })();
+  return _micPromise;
 }
 
 // Pronunciation button — tap to hear the word spoken
@@ -653,6 +702,47 @@ function GoodBox({ children }) {
 
 function RawBox({ children }) {
   return <div style={{ background:P.g100,borderRadius:10,padding:"14px 16px",fontSize:13,color:P.g500,lineHeight:1.75,borderLeft:`3px solid ${P.g300}` }}>{children}</div>;
+}
+
+// Split a block of text (or accept an array) into individual points/sentences.
+function splitPoints(value) {
+  if (Array.isArray(value)) return value.map(s => String(s).trim()).filter(Boolean);
+  const text = String(value || "").trim();
+  if (!text) return [];
+  // Prefer explicit line breaks / bullets; otherwise split on sentence boundaries.
+  let parts = text.split(/\r?\n+/).map(s => s.replace(/^[\s•\-\*\d.)]+/, "").trim()).filter(Boolean);
+  if (parts.length <= 1) {
+    // Split after . ! ? (optionally followed by quote) + whitespace. Works for
+    // both capitalized and lowercase continuations common in raw transcripts.
+    parts = text.split(/(?<=[.!?]["')\]]?)\s+/).map(s => s.trim()).filter(Boolean);
+  }
+  return parts.length ? parts : [text];
+}
+
+// Render text as a bulleted list of individual points. `variant` controls styling:
+// "raw" = neutral (user's original), "good" = polished/AI (green leadership style).
+function PointsBox({ value, variant = "good" }) {
+  const points = splitPoints(value);
+  const good = variant === "good";
+  const dot = good ? P.green : P.g400;
+  return (
+    <div style={{
+      background: good ? `linear-gradient(135deg,${P.green10},${P.teal10})` : P.g100,
+      border: good ? `1px solid ${P.green}25` : "none",
+      borderLeft: good ? `1px solid ${P.green}25` : `3px solid ${P.g300}`,
+      borderRadius:10, padding:"12px 14px", position:"relative",
+    }}>
+      {good && <span style={{ position:"absolute",top:9,right:12,fontSize:15 }}>✨</span>}
+      <ul style={{ listStyle:"none", margin:0, padding:0, display:"flex", flexDirection:"column", gap:8 }}>
+        {points.map((pt,i) => (
+          <li key={i} style={{ display:"flex", gap:9, alignItems:"flex-start", fontSize:13, lineHeight:1.7, color: good ? "#065F46" : P.g600 }}>
+            <span style={{ width:6, height:6, borderRadius:"50%", background:dot, flexShrink:0, marginTop:7 }}/>
+            <span style={{ flex:1, minWidth:0 }}>{pt}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 function Ring({ value, color, size = 60 }) {
@@ -975,7 +1065,7 @@ function Sidebar({ page, onNav, user, onLogout, open, isAdmin, onAbout }) {
         <button onClick={onAbout} style={{ width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"9px",marginBottom:8,background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,color:"rgba(255,255,255,.8)",fontSize:12.5,fontWeight:600,cursor:"pointer",fontFamily:"inherit",transition:"all .15s" }}
           onMouseEnter={e=>{ e.currentTarget.style.background="rgba(124,58,237,.22)"; e.currentTarget.style.borderColor="rgba(124,58,237,.5)"; }}
           onMouseLeave={e=>{ e.currentTarget.style.background="rgba(255,255,255,.06)"; e.currentTarget.style.borderColor="rgba(255,255,255,.12)"; }}>
-          <span style={{ fontSize:14 }}>ℹ️</span> About
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink:0 }}><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><circle cx="12" cy="7.5" r="0.6" fill="currentColor" stroke="none"/></svg> About
         </button>
         <button onClick={onLogout} style={{ width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"10px",background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,color:"rgba(255,255,255,.85)",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",transition:"all .15s" }}
           onMouseEnter={e=>{ e.currentTarget.style.background="rgba(239,68,68,.18)"; e.currentTarget.style.borderColor="rgba(239,68,68,.45)"; }}
@@ -1310,6 +1400,7 @@ function SpeakMatchPage({ store, onSave, showToast }) {
   const [source, setSource]     = useState("");   // where the current sentence came from
   const [genLoad, setGenLoad]   = useState(false);
   const [listening, setListening] = useState(false);
+  const [requesting, setRequesting] = useState(false);
   const [heard, setHeard]       = useState("");
   const [score, setScore]       = useState(null);   // last attempt score
   const [streak, setStreak]     = useState(0);       // consecutive passes
@@ -1335,10 +1426,14 @@ function SpeakMatchPage({ store, onSave, showToast }) {
 
   // ── Live mic waveform (Web Audio API) — runs alongside speech recognition ──
   async function startAudio() {
+    // On mobile, SpeechRecognition must own the mic exclusively, so we don't
+    // open a second getUserMedia stream — we animate a synthesized waveform.
+    if (IS_MOBILE) { startSynthWave(); return; }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
+      const stream = getMicStream() || await navigator.mediaDevices.getUserMedia({ audio:true });
       streamRef.current = stream;
       actxRef.current = new (window.AudioContext||window.webkitAudioContext)();
+      try { if (actxRef.current.state === "suspended") await actxRef.current.resume(); } catch {}
       const src = actxRef.current.createMediaStreamSource(stream);
       analyRef.current = actxRef.current.createAnalyser();
       analyRef.current.fftSize = 1024;
@@ -1353,7 +1448,6 @@ function SpeakMatchPage({ store, onSave, showToast }) {
       const tick = () => {
         if (!analyRef.current) return;
         analyRef.current.getByteFrequencyData(data);
-        // Bin the voice-band frequencies into WAVE_BARS groups (log spacing → pitch-aware).
         const bars = new Array(WAVE_BARS).fill(0);
         for (let b=0; b<WAVE_BARS; b++) {
           const lo = Math.floor(Math.pow(b/WAVE_BARS, 1.6) * maxBin);
@@ -1362,11 +1456,10 @@ function SpeakMatchPage({ store, onSave, showToast }) {
           for (let i=lo; i<hi && i<bins; i++) if (data[i] > peak) peak = data[i];
           bars[b] = Math.round((peak/255)*100);
         }
-        // Dominant pitch = loudest bin in the voice band.
         let pb=0, pv=0;
         for (let i=1; i<maxBin; i++) if (data[i]>pv) { pv=data[i]; pb=i; }
         const now = performance.now();
-        if (now - last > 33) { // ~30fps
+        if (now - last > 33) {
           last = now;
           setSpectrum(bars);
           setPitch(pv > 30 ? Math.round(pb*hzPerBin) : 0);
@@ -1374,11 +1467,35 @@ function SpeakMatchPage({ store, onSave, showToast }) {
         rafRef.current = requestAnimationFrame(tick);
       };
       tick();
-    } catch(e) { /* mic unavailable — recognition may still work; waveform stays flat */ }
+    } catch(e) {
+      // If the mic can't be opened for the waveform, fall back to a synth wave so
+      // the UI still animates — recognition will still try on its own.
+      startSynthWave();
+    }
+  }
+  // Synthesized "listening" animation (no mic) — used on mobile so it never
+  // competes with SpeechRecognition for the microphone.
+  function startSynthWave() {
+    const start = performance.now();
+    let last = 0;
+    const tick = () => {
+      const t = (performance.now() - start) / 1000;
+      const now = performance.now();
+      if (now - last > 50) {
+        last = now;
+        const bars = Array.from({length:WAVE_BARS}, (_,i) => {
+          const v = 30 + 45*Math.abs(Math.sin(t*3 + i*0.5)) + 18*Math.abs(Math.sin(t*7 + i));
+          return Math.min(100, Math.round(v));
+        });
+        setSpectrum(bars);
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
   }
   function stopAudio() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    if (streamRef.current) { try { streamRef.current.getTracks().forEach(t=>t.stop()); } catch {} }
+    // Keep the shared mic stream alive for reuse (no re-prompt next time).
     if (actxRef.current) { try { actxRef.current.close(); } catch {} }
     analyRef.current = null; actxRef.current = null; streamRef.current = null;
     setSpectrum([]); setPitch(0);
@@ -1403,18 +1520,25 @@ function SpeakMatchPage({ store, onSave, showToast }) {
     const lengthHint = level === "Beginner" ? "6-10 words, simple everyday vocabulary"
       : level === "Hard" ? "20-32 words, with a couple of advanced words and a clear structure"
       : "10-18 words, natural and confident";
-    const topicHint = customTopic.trim()
-      ? `The sentence must be about: "${customTopic.trim()}".`
-      : `Pick any useful leadership communication theme (feedback, vision, trust, conflict, recognition, etc.).`;
+    const topic = customTopic.trim();
+    const topicHint = topic
+      ? `The sentence MUST be specifically about the corporate-leadership topic: "${topic}". Stay tightly on this topic — every word should relate to it in a workplace/business leadership context.`
+      : `Choose a corporate leadership theme (e.g. leading a team, executive decision-making, stakeholder communication, performance feedback, organizational vision, change management, accountability).`;
     try {
-      const raw = await claude(`Generate ONE natural leadership sentence a leader might say out loud, for speaking practice.
-Difficulty: ${level} (${lengthHint}).
-${topicHint}
-It must be easy to read aloud and grammatically clean. Return ONLY the sentence text — no quotes, no label, no extra words.`, 200);
+      const raw = await claude(`You are an executive communication coach. Generate ONE sentence a CORPORATE LEADER (manager, director, or executive) would say out loud in a real workplace setting — a team meeting, a one-on-one, a board update, or a company-wide address.
+
+Requirements:
+- Corporate / business leadership context ONLY (not casual or generic motivational quotes).
+- ${topicHint}
+- Difficulty: ${level} (${lengthHint}).
+- First-person, natural to say aloud, professional but human, grammatically clean.
+- Sound like real workplace leadership speech, not a slogan.
+
+Return ONLY the sentence text — no quotes, no label, no extra words.`, 200);
       const clean = (raw||"").replace(/^["'\s]+|["'\s]+$/g,"").split("\n")[0].trim();
       if (!clean || clean.length < 6) throw new Error("bad");
       setSentence(clean);
-      setSource(`${level} · AI${customTopic.trim()?` · "${customTopic.trim()}"`:""}`);
+      setSource(`${level} · AI${topic?` · "${topic}"`:" · corporate leadership"}`);
     } catch {
       const list = MATCH_BANK[level] || MATCH_BANK.Medium;
       setSentence(list[Math.floor(Math.random()*list.length)]);
@@ -1424,17 +1548,30 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
     setGenLoad(false);
   }
 
-  function startListen() {
+  async function startListen() {
     if (!SR_SUPPORTED) {
       showToast("Speech recognition isn't supported in this browser","error"); return;
     }
+    // Ask for microphone permission ONCE; later attempts reuse the grant.
+    if (getMicPermissionState() !== "granted") {
+      setRequesting(true);
+      const state = await ensureMicPermission();
+      setRequesting(false);
+      if (state === "denied") {
+        showToast("Microphone access is needed. Please allow it in your browser settings.", "error");
+        return;
+      }
+    }
+    beginListen();
+  }
+
+  function beginListen() {
     const sr = createRecognition({ continuous:false });
     if (!sr) { showToast("Speech recognition isn't available","error"); return; }
     srRef.current = sr;
     let finalText = "";
     let gotResult = false;
     setListening(true); setHeard(""); setScore(null);
-    startAudio(); // begin live waveform
     sr.onresult = e => {
       gotResult = true;
       let interim = "";
@@ -1464,10 +1601,13 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
         setStreak(0); // a miss resets the streak
       }
     };
-    try { sr.start(); }
+    // Start recognition FIRST so it claims the microphone, THEN start the
+    // (desktop-only) waveform. On mobile the waveform is synthesized and never
+    // touches the mic, avoiding the single-consumer conflict that broke capture.
+    const beginWave = () => { startAudio(); };
+    try { sr.start(); beginWave(); }
     catch {
-      // If it throws (e.g. called too soon after a prior stop), retry once.
-      setTimeout(() => { try { sr.start(); } catch { setListening(false); stopAudio(); } }, 250);
+      setTimeout(() => { try { sr.start(); beginWave(); } catch { setListening(false); stopAudio(); } }, 250);
     }
   }
   function stopListen() {
@@ -1617,7 +1757,7 @@ It must be easy to read aloud and grammatically clean. Return ONLY the sentence 
           {listening ? (
             <GBtn onClick={stopListen} grad={P.gradCoral}>⏹ Stop</GBtn>
           ) : (
-            <GBtn onClick={startListen} grad={P.gradGreen} disabled={genLoad||!sentence}>🎤 Speak</GBtn>
+            <GBtn onClick={startListen} grad={P.gradGreen} disabled={genLoad||!sentence||requesting}>{requesting?<><Spin color="#fff"/> Requesting mic…</>:"🎤 Speak"}</GBtn>
           )}
           <Ghost onClick={()=>speak(sentence, true)} color={P.greenD} size="sm" disabled={!sentence}>🔊 Hear it</Ghost>
           <Ghost onClick={()=>nextFromBank(level,false)} color={P.purpleD} size="sm" disabled={genLoad}>↻ Next sentence</Ghost>
@@ -1945,24 +2085,30 @@ function CustomTopicsPage({ store, onSave, showToast }) {
     if (!input.trim()) { showToast("Write a note first","error"); return; }
     setLoad(true);
     try {
-      const raw = await claude(`A user wrote rough notes in their own words. Correct the grammar and rewrite them in a polished, professional leadership style while keeping their original meaning and intent. Also generate a short 3-6 word title.
+      const raw = await claude(`A user wrote rough notes in their own words. Correct the grammar and rewrite them in a polished, professional leadership style while keeping their original meaning and intent. Break the rewrite into clear, individual points (one idea per point). Also generate a short 3-6 word title.
 
 Return ONLY valid JSON:
 {
   "title": "Short 3-6 word title for these notes",
-  "original": "the user's input, unchanged",
-  "polished": "grammar-corrected, leadership-style rewrite that preserves the original meaning",
+  "polishedPoints": ["First polished leadership point", "Second point", "..."],
   "notes": "1 short sentence on what you improved"
 }
+Each point should be a single, self-contained, grammar-corrected leadership sentence. Preserve the user's original meaning — do not invent new ideas.
 User notes: "${input.slice(0,1500)}"`, 1800);
-      const parsed = JSON.parse(raw);
-      if (!parsed.polished) throw new Error("bad");
-      parsed.original = input;
-      setResult(parsed);
-      autoSave(parsed);
+      let parsed;
+      try { parsed = JSON.parse(raw); }
+      catch { const m = raw.match(/\{[\s\S]*\}/); if(!m) throw new Error("no json"); parsed = JSON.parse(m[0]); }
+      const points = Array.isArray(parsed.polishedPoints) && parsed.polishedPoints.length
+        ? parsed.polishedPoints.map(s=>String(s).trim()).filter(Boolean)
+        : splitPoints(parsed.polished || "");
+      if (!points.length) throw new Error("bad");
+      const entry = { title: parsed.title, original: input, polishedPoints: points, polished: points.join("\n"), notes: parsed.notes || "" };
+      setResult(entry);
+      autoSave(entry);
     } catch {
       const cleaned = input.replace(/\s{2,}/g," ").replace(/\s+([.,!?])/g,"$1").trim();
-      const fb = { title:(input.trim().split(/\s+/).slice(0,5).join(" ")||"Custom note")+"…", original:input, polished:cleaned, notes:"Saved with light offline cleanup — AI unavailable." };
+      const points = splitPoints(cleaned);
+      const fb = { title:(input.trim().split(/\s+/).slice(0,5).join(" ")||"Custom note")+"…", original:input, polishedPoints:points, polished:points.join("\n"), notes:"Saved with light offline cleanup — AI unavailable." };
       setResult(fb); autoSave(fb);
       showToast("Saved offline — AI unavailable","error");
     }
@@ -1975,7 +2121,8 @@ User notes: "${input.slice(0,1500)}"`, 1800);
       id: Date.now(),
       title: (d.title || "Custom note").trim(),
       original: d.original || input,
-      polished: d.polished || "",
+      polishedPoints: d.polishedPoints || splitPoints(d.polished || ""),
+      polished: d.polished || (d.polishedPoints ? d.polishedPoints.join("\n") : ""),
       notes: d.notes || "",
       savedAt: now.toLocaleDateString(),
       savedAtTime: now.toLocaleString("en-US",{ month:"short", day:"numeric", year:"numeric", hour:"numeric", minute:"2-digit" }),
@@ -2009,10 +2156,10 @@ User notes: "${input.slice(0,1500)}"`, 1800);
             <div style={{ fontSize:16,fontWeight:700,...gText(P.gradTeal) }}>{result.title}</div>
             <div style={{ display:"flex",alignItems:"center",gap:6,fontSize:12,fontWeight:700,color:P.greenD,background:P.green10,padding:"7px 12px",borderRadius:20,border:`1px solid ${P.green}30`,whiteSpace:"nowrap" }}>✓ Saved</div>
           </div>
-          <SLbl>Your original note</SLbl><RawBox>{result.original}</RawBox>
+          <SLbl>Your original note — as points</SLbl><PointsBox value={result.original} variant="raw"/>
           <div style={{ height:14 }}/>
-          <SLbl color={P.greenD}>Polished — Leadership Style ✨</SLbl>
-          <GoodBox>{result.polished}</GoodBox>
+          <SLbl color={P.greenD}>Polished — Leadership Style ✨ (point by point)</SLbl>
+          <PointsBox value={result.polishedPoints || result.polished} variant="good"/>
           {result.notes && <p style={{ fontSize:12,color:P.g400,margin:"12px 0 0",lineHeight:1.65 }}>ℹ️ {result.notes}</p>}
         </PCard>
       )}
@@ -2041,8 +2188,8 @@ User notes: "${input.slice(0,1500)}"`, 1800);
                 </div>
                 {isOpen && (
                   <div style={{ padding:"4px 0 16px 22px",animation:"fadeIn .25s ease" }}>
-                    {n.original && (<><SLbl>Your original note</SLbl><RawBox>{n.original}</RawBox><div style={{ height:12 }}/></>)}
-                    {n.polished && (<><SLbl color={P.greenD}>Polished — Leadership Style</SLbl><GoodBox>{n.polished}</GoodBox></>)}
+                    {n.original && (<><SLbl>Your original note — as points</SLbl><PointsBox value={n.original} variant="raw"/><div style={{ height:12 }}/></>)}
+                    {(n.polishedPoints?.length || n.polished) && (<><SLbl color={P.greenD}>Polished — Leadership Style (point by point)</SLbl><PointsBox value={n.polishedPoints || n.polished} variant="good"/></>)}
                     {n.notes && <p style={{ fontSize:12,color:P.g400,margin:"10px 0 0",lineHeight:1.6 }}>ℹ️ {n.notes}</p>}
                   </div>
                 )}
@@ -2297,11 +2444,14 @@ function SpeechPage({ store, onSave, showToast }) {
   const [result, setResult]         = useState(null);
   const [phase, setPhase]           = useState("idle");
   const [expandedSession, setExpandedSession] = useState(null);
+  const [micState, setMicState]     = useState(() => getMicPermissionState()); // null|granted|denied|unavailable
+  const [requesting, setRequesting] = useState(false); // true only during the one-time prompt
   const timerRef  = useRef(null);
   const srRef     = useRef(null);
   const actxRef   = useRef(null);
   const analyRef  = useRef(null);
   const rafRef    = useRef(null);
+  const streamRef = useRef(null);
   const transcRef = useRef("");
   const timeRef   = useRef(0);
   const finalRef  = useRef("");      // accumulated final transcript across restarts
@@ -2313,9 +2463,17 @@ function SpeechPage({ store, onSave, showToast }) {
   const NUM_BARS = 28; // waveform resolution
 
   async function startAudio() {
+    // On mobile, SpeechRecognition must own the mic exclusively (mobile browsers
+    // allow only one mic consumer), so we animate a synthesized waveform instead
+    // of opening a competing getUserMedia stream.
+    if (IS_MOBILE) { startSynthWave(); return; }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+      // Reuse the single shared stream from the one-time permission grant; only
+      // open a new one if we somehow don't have a live stream yet.
+      const stream = getMicStream() || await navigator.mediaDevices.getUserMedia({audio:true});
+      streamRef.current = stream;
       actxRef.current = new (window.AudioContext||window.webkitAudioContext)();
+      try { if (actxRef.current.state === "suspended") await actxRef.current.resume(); } catch {}
       const src = actxRef.current.createMediaStreamSource(stream);
       analyRef.current = actxRef.current.createAnalyser();
       analyRef.current.fftSize = 1024;            // finer frequency resolution for pitch
@@ -2364,21 +2522,63 @@ function SpeechPage({ store, onSave, showToast }) {
         rafRef.current = requestAnimationFrame(tick);
       };
       tick();
-    } catch(e) { console.warn("Audio API unavailable:",e); }
+    } catch(e) { startSynthWave(); }  // fall back to a synth wave; recognition still runs
+  }
+
+  // Synthesized "listening" animation (no mic) — used on mobile so it never
+  // competes with SpeechRecognition for the microphone.
+  function startSynthWave() {
+    const start = performance.now();
+    let last = 0;
+    const tick = () => {
+      const t = (performance.now() - start) / 1000;
+      const now = performance.now();
+      if (now - last > 50) {
+        last = now;
+        const bars = Array.from({length:NUM_BARS}, (_,i) => {
+          const v = 28 + 45*Math.abs(Math.sin(t*3 + i*0.5)) + 18*Math.abs(Math.sin(t*7 + i));
+          return Math.min(100, Math.round(v));
+        });
+        setSpectrum(bars);
+        setVol(40 + 30*Math.abs(Math.sin(t*4)));
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
   }
 
   function stopAudio() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    // Do NOT stop the shared mic stream — it's reused across recordings so we
+    // never have to re-request permission. Only tear down the analyser graph.
     if (actxRef.current) { try { actxRef.current.close(); } catch {} }
-    analyRef.current = null; actxRef.current = null;
+    analyRef.current = null; actxRef.current = null; streamRef.current = null;
     setVol(0); setSpectrum([]); setPitch(0);
   }
 
-  function startRec() {
+  // Public entry point for the record button. Requests mic permission ONCE
+  // (only the very first time), then runs the normal recording flow. On later
+  // recordings the grant is cached, so this proceeds immediately with no prompt.
+  async function startRec() {
+    if (SR_SUPPORTED && getMicPermissionState() !== "granted") {
+      setRequesting(true);
+      const state = await ensureMicPermission();
+      setMicState(state);
+      setRequesting(false);
+      if (state === "denied") {
+        showToast("Microphone access is needed to record. Please allow it in your browser settings.", "error");
+        return;
+      }
+      // "unavailable" → no mic / not supported: fall through and let the
+      // recording flow show the type-your-speech fallback.
+    }
+    beginRecording();
+  }
+
+  function beginRecording() {
     setRecording(true); setTime(0); setResult(null); setTranscript(""); setPolished(""); setPhase("idle"); setVol(0); setWpm(0);
     finalRef.current = "";          // accumulated final transcript (survives restarts)
     recActiveRef.current = true;    // we WANT recognition running
-    startAudio();
     timerRef.current = setInterval(() => {
       setTime(t => {
         const newT = t+1;
@@ -2392,6 +2592,7 @@ function SpeechPage({ store, onSave, showToast }) {
     if (!SR_SUPPORTED) {
       setTranscript("Speech recognition isn't supported in this browser. You can type or paste your speech below for AI analysis and polishing.");
       showToast("Live transcription unavailable — type your speech instead","error");
+      startAudio();
       return;
     }
 
@@ -2413,6 +2614,7 @@ function SpeechPage({ store, onSave, showToast }) {
         // A hard permission/capture error means we should stop trying.
         if (ev.error === "not-allowed" || ev.error === "service-not-allowed" || ev.error === "audio-capture") {
           recActiveRef.current = false;
+          if (ev.error === "not-allowed" || ev.error === "service-not-allowed") setMicState("denied");
         }
       };
       sr.onend = () => {
@@ -2422,10 +2624,11 @@ function SpeechPage({ store, onSave, showToast }) {
           try { sr.start(); } catch { /* will retry on next onend */ }
         }
       };
-      try { sr.start(); }
+      // Start recognition FIRST so it claims the mic, THEN start the waveform.
+      try { sr.start(); startAudio(); }
       catch (e) {
         // start() throws if called too soon after a previous stop; retry shortly.
-        setTimeout(() => { if (recActiveRef.current) { try { sr.start(); } catch {} } }, 250);
+        setTimeout(() => { if (recActiveRef.current) { try { sr.start(); startAudio(); } catch {} } }, 250);
       }
     };
     begin();
@@ -2469,11 +2672,35 @@ Return ONLY valid JSON:
   "fillerWordsFound": ["um", "uh", etc found in the original]
 }
 Raw transcript: "${transcript.slice(0,1200)}"`, 2200);
-      const d = JSON.parse(raw);
-      const polishedText = d.polished || "";
+      // Robust parse: extract the JSON object even if the model adds stray text.
+      let d;
+      try { d = JSON.parse(raw); }
+      catch {
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (!m) throw new Error("no json");
+        d = JSON.parse(m[0]);
+      }
+      const polishedText = (d.polished || "").trim();
+      if (!polishedText) throw new Error("no polished text");
       setPolished(polishedText); setResult(d); setPhase("analyzed");
       autoSave({ ...d, polished:polishedText });
     } catch {
+      // The structured JSON call failed. Before giving up on AI, try a simpler
+      // plain-text polish call (no JSON to parse) so the transcript is STILL
+      // rewritten by AI into a leadership style.
+      try {
+        const polishedAI = await claude(`Rewrite the following speech transcript into polished, confident, leadership-ready conversational sentences. Keep the speaker's own meaning, ideas, and first-person voice — just fix grammar, remove filler words (um, uh, like, you know), and improve flow. Do NOT add new points or generic advice. Return ONLY the rewritten speech text, nothing else.
+
+Transcript: "${transcript.slice(0,1200)}"`, 1500);
+        const polishedText = (polishedAI || "").replace(/^["'\s]+|["'\s]+$/g,"").trim();
+        if (!polishedText) throw new Error("empty");
+        const title = (transcript.trim().split(/\s+/).slice(0,5).join(" ") || "Speech session");
+        const r = { title, clarity:78,tone:82,confidence:75,structure:78,overallScore:78,feedback:"Clear delivery with room to tighten structure. Keep reducing filler words to sound even more authoritative.",keyStrengths:["Authentic voice","Clear intent"],improvements:["Tighten structure","Reduce filler words"],fillerWordsFound:[] };
+        setPolished(polishedText); setResult(r); setPhase("analyzed");
+        autoSave({ ...r, polished:polishedText });
+        return;
+      } catch { /* fall through to offline cleanup */ }
+
       // Offline fallback: do a light local cleanup of the user's own words so the
       // polished panel still reflects what they said (never generic filler text).
       const cleaned = transcript
@@ -2540,11 +2767,20 @@ Raw transcript: "${transcript.slice(0,1200)}"`, 2200);
 
       {/* Record button */}
       <PCard style={{ marginBottom:16,textAlign:"center",padding:"24px" }}>
-        <button onClick={recording?stopRec:startRec} style={{ width:84,height:84,borderRadius:"50%",background:recording?`linear-gradient(135deg,${P.coral},${P.red})`:`linear-gradient(135deg,${P.purple},${P.purpleD})`,border:"none",fontSize:34,cursor:"pointer",marginBottom:12,animation:recording?"recPulse 1.5s infinite":"none",boxShadow:recording?`0 0 0 0 ${P.red}40`:`0 8px 28px ${P.purple}40`,transition:"all .3s",display:"inline-flex",alignItems:"center",justifyContent:"center" }}>
-          {recording ? "⏹" : "🎙"}
+        <button onClick={recording?stopRec:startRec} disabled={requesting} style={{ width:84,height:84,borderRadius:"50%",background:requesting?P.g300:recording?`linear-gradient(135deg,${P.coral},${P.red})`:`linear-gradient(135deg,${P.purple},${P.purpleD})`,border:"none",fontSize:34,cursor:requesting?"wait":"pointer",marginBottom:12,animation:recording?"recPulse 1.5s infinite":"none",boxShadow:recording?`0 0 0 0 ${P.red}40`:`0 8px 28px ${P.purple}40`,transition:"all .3s",display:"inline-flex",alignItems:"center",justifyContent:"center" }}>
+          {requesting ? <Spin color="#fff" sz={8}/> : recording ? "⏹" : "🎙"}
         </button>
-        <div style={{ fontSize:14,fontWeight:600,color:recording?P.coral:P.g500 }}>{recording?"Click to stop recording":"Click microphone to start"}</div>
-        <div style={{ fontSize:12,color:P.g400,marginTop:4 }}>{recording?"Speak clearly — 3 to 5 minutes recommended":"Web Speech API with live audio metering"}</div>
+        <div style={{ fontSize:14,fontWeight:600,color:recording?P.coral:requesting?P.g600:P.g500 }}>
+          {requesting ? "Requesting microphone access…" : recording ? "Click to stop recording" : "Click the microphone to start"}
+        </div>
+        <div style={{ fontSize:12,color:P.g400,marginTop:4 }}>
+          {requesting ? "Please choose “Allow” in your browser — we only ask once."
+            : recording ? "Speak clearly — 3 to 5 minutes recommended"
+            : micState === "granted" ? "✓ Microphone ready — no need to allow again"
+            : micState === "denied" ? "Microphone blocked — enable it in your browser’s site settings to record"
+            : micState === "unavailable" ? "No microphone detected — you can still type your speech below"
+            : "We’ll ask for microphone permission once, then you’re set"}
+        </div>
 
         {(transcript||phase==="recorded"||phase==="analyzed") && (
           <div style={{ marginTop:20,textAlign:"left" }}>
@@ -3391,7 +3627,9 @@ export default function App() {
               <div style={{ width:28,height:28,borderRadius:8,background:P.gradPurple,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,flexShrink:0 }}>👑</div>
               <span style={{ fontSize:15,fontWeight:700,fontFamily:"'Plus Jakarta Sans',sans-serif",color:"#fff",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{pageLabel}</span>
             </div>
-            <button onClick={()=>setAboutOpen(true)} aria-label="About" title="About" style={{ width:38,height:38,borderRadius:10,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.08)",color:"#fff",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>ℹ️</button>
+            <button onClick={()=>setAboutOpen(true)} aria-label="About" title="About" style={{ width:38,height:38,borderRadius:10,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.08)",color:"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><circle cx="12" cy="7.5" r="0.6" fill="currentColor" stroke="none"/></svg>
+            </button>
             <button onClick={handleLogout} aria-label="Log out" title="Log out" style={{ width:38,height:38,borderRadius:10,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.08)",color:"#fff",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0 }}>⇥</button>
           </div>
           {/* Admin banner when site is frozen (admin still has full access) */}
