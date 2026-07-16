@@ -149,11 +149,37 @@ const NAV = [
 
 // ── Storage ───────────────────────────────────────────────────────────────────
 // Data is namespaced PER USER so one user can never see another user's saved data.
-// Layout in localStorage:
+// Layout:
 //   leadspeak_users : { "<email>": { savedTopics:[], savedVocab:[], ... }, ... }
-//   leadspeak_session (or sessionStorage) : the logged-in user object
-// Remember Me decides whether the session is written to localStorage (persists
-// across browser restarts) or sessionStorage (cleared when the tab closes).
+//   leadspeak_session : the logged-in user object
+// Remember Me decides whether the session should also survive a full browser
+// restart (localStorage) or only the current tab (sessionStorage).
+//
+// IMPORTANT: some hosting/preview environments restrict or sandbox
+// localStorage (reads/writes silently fail or don't persist between calls).
+// When that happens with the old code, an account created during Sign Up
+// would "vanish" the moment you tried to Sign In again — the exact "can't
+// log in again with the same credentials" bug. To make auth reliable
+// everywhere, we keep an in-memory Map as the SOURCE OF TRUTH for the life
+// of the page, and treat localStorage as a best-effort layer on top of it
+// (so data still survives real page reloads/restarts when storage works).
+const _mem = new Map();
+const safeGet = key => {
+  if (_mem.has(key)) return _mem.get(key);
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw !== null) { _mem.set(key, raw); return raw; }
+  } catch {}
+  return null;
+};
+const safeSet = (key, value) => {
+  _mem.set(key, value);
+  try { localStorage.setItem(key, value); } catch {}
+};
+const safeRemove = key => {
+  _mem.delete(key);
+  try { localStorage.removeItem(key); } catch {}
+};
 
 const USERS_KEY  = "leadspeak_users_v1";
 const SESS_KEY   = "leadspeak_session_v1";
@@ -162,8 +188,8 @@ const REMEMBER_KEY = "leadspeak_remember";
 const EMPTY_USER_DATA = { savedTopics:[], savedSentences:[], savedVocab:[], savedTalks:[], savedSpeeches:[], customTalks:[], customNotes:[], matchSentences:[] };
 const DATA_KEYS = Object.keys(EMPTY_USER_DATA);
 
-const _readUsers = () => { try { return JSON.parse(localStorage.getItem(USERS_KEY) || "{}"); } catch { return {}; } };
-const _writeUsers = m => { try { localStorage.setItem(USERS_KEY, JSON.stringify(m)); } catch {} };
+const _readUsers = () => { try { return JSON.parse(safeGet(USERS_KEY) || "{}"); } catch { return {}; } };
+const _writeUsers = m => { try { safeSet(USERS_KEY, JSON.stringify(m)); } catch {} };
 
 // Load a single user's saved data (by email). Returns a fresh empty set if none.
 function loadUserData(email) {
@@ -196,11 +222,14 @@ function allUsersUsage() {
   }).sort((a,b) => b.bytes - a.bytes);
 }
 
-// Session helpers — Remember Me gates localStorage vs sessionStorage.
-const isRemembered = () => { try { return localStorage.getItem(REMEMBER_KEY) === "1"; } catch { return false; } };
+// Session helpers — Remember Me gates whether the session survives a full
+// browser restart. It's always kept in the safe (mem + localStorage) layer so
+// it survives for the life of the tab either way; when NOT remembered we also
+// mirror to sessionStorage (best-effort) and skip the persistent layer.
+const isRemembered = () => safeGet(REMEMBER_KEY) === "1";
 function loadSession() {
   try {
-    const raw = (isRemembered() ? localStorage.getItem(SESS_KEY) : null)
+    const raw = safeGet(SESS_KEY)
              || (typeof sessionStorage !== "undefined" ? sessionStorage.getItem(SESS_KEY) : null);
     return raw ? JSON.parse(raw) : null;
   } catch { return null; }
@@ -208,33 +237,32 @@ function loadSession() {
 function saveSession(user, remember) {
   try {
     const json = JSON.stringify(user);
+    safeSet(SESS_KEY, json);
+    try { sessionStorage.setItem(SESS_KEY, json); } catch {}
     if (remember) {
-      localStorage.setItem(REMEMBER_KEY, "1");
-      localStorage.setItem(SESS_KEY, json);
-      if (user.email) localStorage.setItem("leadspeak_remember_email", user.email);
-      try { sessionStorage.setItem(SESS_KEY, json); } catch {}
+      safeSet(REMEMBER_KEY, "1");
+      if (user.email) safeSet("leadspeak_remember_email", user.email);
     } else {
-      localStorage.removeItem(REMEMBER_KEY);
-      localStorage.removeItem(SESS_KEY);
-      localStorage.removeItem("leadspeak_remember_email");
-      try { sessionStorage.setItem(SESS_KEY, json); } catch {}
+      safeRemove(REMEMBER_KEY);
+      safeRemove("leadspeak_remember_email");
     }
   } catch {}
 }
 function clearSession() {
-  try { localStorage.removeItem(SESS_KEY); } catch {}
+  safeRemove(SESS_KEY);
   try { sessionStorage.removeItem(SESS_KEY); } catch {}
   // Note: we keep the remembered email so the login field can prefill it.
 }
 
 // ── Accounts (credential store) ───────────────────────────────────────────────
-// Frontend-only artifact: accounts live in localStorage. Passwords are never
-// stored in plain text — each is salted and hashed with SHA-256 (Web Crypto).
-// This makes the login flow strict (only valid, matching credentials work),
-// though a production app would verify credentials on a backend.
+// Frontend-only artifact: accounts live in the safe storage layer above.
+// Passwords are never stored in plain text — each is salted and hashed with
+// SHA-256 (Web Crypto). This makes the login flow strict (only valid,
+// matching credentials work), though a production app would verify
+// credentials on a backend.
 const AK = "leadspeak_accounts_v1";
-const loadAccounts = () => { try { return JSON.parse(localStorage.getItem(AK)||"[]"); } catch { return []; } };
-const saveAccounts = a => { try { localStorage.setItem(AK, JSON.stringify(a)); } catch {} };
+const loadAccounts = () => { try { return JSON.parse(safeGet(AK)||"[]"); } catch { return []; } };
+const saveAccounts = a => { try { safeSet(AK, JSON.stringify(a)); } catch {} };
 const normEmail = e => (e||"").trim().toLowerCase();
 
 // ── Admin & site-freeze ───────────────────────────────────────────────────────
@@ -245,8 +273,8 @@ const ADMIN_DEFAULT_PASSWORD = "Admin@12345";   // default credentials for first
 const isAdminEmail = e => normEmail(e) === ADMIN_EMAIL;
 
 const FREEZE_KEY = "leadspeak_frozen";
-const isSiteFrozen = () => { try { return localStorage.getItem(FREEZE_KEY) === "1"; } catch { return false; } };
-const setSiteFrozen = on => { try { on ? localStorage.setItem(FREEZE_KEY,"1") : localStorage.removeItem(FREEZE_KEY); } catch {} };
+const isSiteFrozen = () => safeGet(FREEZE_KEY) === "1";
+const setSiteFrozen = on => { on ? safeSet(FREEZE_KEY,"1") : safeRemove(FREEZE_KEY); };
 
 // Salted SHA-256 hash. Falls back to a simple internal hash if Web Crypto is
 // unavailable (e.g. non-secure context) so login still functions correctly.
@@ -320,7 +348,25 @@ async function updatePassword(email, newPassword) {
   return { ok:true };
 }
 
-// ── Claude API ────────────────────────────────────────────────────────────────
+// ── AI providers (Polish & Analyze) ─────────────────────────────────────────
+// Claude is pre-wired: this environment injects the credentials for the
+// fetch below automatically, so it works with zero setup.
+// ChatGPT and Gemini are NOT pre-authenticated anywhere in this app — there
+// are no "existing credentials" for them to reuse. The most honest way to
+// offer real ChatGPT/Gemini output (rather than faking it) is to ask the
+// person for their own API key the first time they pick that provider, then
+// call that provider's official endpoint directly from the browser. The key
+// is kept only in memory for the current tab — never written to
+// localStorage/sessionStorage or sent anywhere except that provider's API.
+const _providerKeys = { openai:null, gemini:null };
+function getProviderKey(provider, label) {
+  if (_providerKeys[provider]) return _providerKeys[provider];
+  const key = (typeof window !== "undefined" ? window.prompt(`Enter your ${label} API key to use ${label} for polishing (used only for this session, never stored):`) : "") || "";
+  const trimmed = key.trim();
+  if (trimmed) _providerKeys[provider] = trimmed;
+  return trimmed;
+}
+
 async function claude(prompt, maxTok=1500) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST", headers:{"Content-Type":"application/json"},
@@ -329,6 +375,36 @@ async function claude(prompt, maxTok=1500) {
   const d = await r.json();
   return d.content.filter(b=>b.type==="text").map(b=>b.text).join("").replace(/```json\n?|```\n?/g,"").trim();
 }
+
+async function chatgpt(prompt, maxTok=1500) {
+  const key = getProviderKey("openai", "ChatGPT");
+  if (!key) throw new Error("no-key");
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method:"POST", headers:{ "Content-Type":"application/json", "Authorization":`Bearer ${key}` },
+    body: JSON.stringify({ model:"gpt-4o-mini", max_tokens:maxTok, messages:[{role:"user",content:prompt}] }),
+  });
+  const d = await r.json();
+  if (d.error) { if (/api.?key|auth/i.test(d.error.message||"")) _providerKeys.openai = null; throw new Error(d.error.message || "ChatGPT request failed"); }
+  return (d.choices?.[0]?.message?.content || "").replace(/```json\n?|```\n?/g,"").trim();
+}
+
+async function gemini(prompt, maxTok=1500) {
+  const key = getProviderKey("gemini", "Gemini");
+  if (!key) throw new Error("no-key");
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`, {
+    method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ contents:[{ parts:[{ text:prompt }] }], generationConfig:{ maxOutputTokens:maxTok } }),
+  });
+  const d = await r.json();
+  if (d.error) { if (/api.?key|auth/i.test(d.error.message||"")) _providerKeys.gemini = null; throw new Error(d.error.message || "Gemini request failed"); }
+  return (d.candidates?.[0]?.content?.parts?.map(p=>p.text).join("") || "").replace(/```json\n?|```\n?/g,"").trim();
+}
+
+const AI_PROVIDERS = {
+  claude:  { label:"Claude",  call:claude,  needsKey:false, grad:"linear-gradient(135deg,#D97706,#7C3AED)" },
+  chatgpt: { label:"ChatGPT", call:chatgpt, needsKey:true,  grad:"linear-gradient(135deg,#10A37F,#1A7F64)" },
+  gemini:  { label:"Gemini",  call:gemini,  needsKey:true,  grad:"linear-gradient(135deg,#4285F4,#9B72CB)" },
+};
 
 // ── Global CSS ────────────────────────────────────────────────────────────────
 const GCSS = `
@@ -631,7 +707,10 @@ function getMicStream() {
   return null;
 }
 async function ensureMicPermission() {
-  if (_micPermission === "granted" && getMicStream()) return "granted"; // already allowed
+  // On mobile, we only need this call to trigger/confirm the OS permission
+  // prompt — we never hold on to the stream (see below), so "granted" alone
+  // is enough to skip re-prompting.
+  if (_micPermission === "granted" && (IS_MOBILE || getMicStream())) return "granted";
   if (_micPromise) return _micPromise;                                  // request in flight
   if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     _micPermission = "unavailable";
@@ -639,9 +718,21 @@ async function ensureMicPermission() {
   }
   _micPromise = (async () => {
     try {
-      // The single prompt. We KEEP the stream so the waveform can reuse it
-      // instead of calling getUserMedia again on every recording.
-      _micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (IS_MOBILE) {
+        // Mobile browsers generally allow only ONE microphone consumer at a
+        // time, and SpeechRecognition needs exclusive access to it. Holding
+        // this stream open (as the old code did) starves SpeechRecognition
+        // of audio and it silently captures nothing — this was the root
+        // cause of recording not working on mobile. We only needed this
+        // call to confirm the permission prompt, so release it immediately.
+        stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        _micStream = null;
+      } else {
+        // Desktop: keep the stream alive so the waveform can reuse it
+        // instead of calling getUserMedia again on every recording.
+        _micStream = stream;
+      }
       _micPermission = "granted";
     } catch (e) {
       _micPermission = (e && (e.name === "NotFoundError" || e.name === "NotReadableError")) ? "unavailable" : "denied";
@@ -794,17 +885,13 @@ function AuthPage({ onAuth, frozen }) {
   const [showCf, setShowCf] = useState(false);
   const [busy, setBusy] = useState(false);
   const [authErr, setAuthErr] = useState("");
-  const [remember, setRemember] = useState(() => {
-    try { return localStorage.getItem(REMEMBER_KEY) === "1"; } catch { return false; }
-  });
+  const [remember, setRemember] = useState(() => isRemembered());
   const [resetSent, setResetSent] = useState(false);
 
   // Prefill the remembered email so "Remember me" actually remembers something.
   useEffect(() => {
-    try {
-      const e = localStorage.getItem("leadspeak_remember_email") || "";
-      if (e) setForm(f => ({ ...f, email:e }));
-    } catch {}
+    const e = safeGet("leadspeak_remember_email") || "";
+    if (e) setForm(f => ({ ...f, email:e }));
   }, []);
 
   const vs = {
@@ -827,14 +914,12 @@ function AuthPage({ onAuth, frozen }) {
   function persistRememberEmail(email) {
     // Only manages the prefill email + remember flag; session persistence is
     // handled by the parent via saveSession(user, remember).
-    try {
-      if (remember) {
-        localStorage.setItem(REMEMBER_KEY, "1");
-        localStorage.setItem("leadspeak_remember_email", normEmail(email));
-      } else {
-        localStorage.removeItem("leadspeak_remember_email");
-      }
-    } catch {}
+    if (remember) {
+      safeSet(REMEMBER_KEY, "1");
+      safeSet("leadspeak_remember_email", normEmail(email));
+    } else {
+      safeRemove("leadspeak_remember_email");
+    }
   }
 
   async function submit() {
@@ -2443,6 +2528,7 @@ function SpeechPage({ store, onSave, showToast }) {
   const [polished, setPolished]     = useState("");
   const [result, setResult]         = useState(null);
   const [phase, setPhase]           = useState("idle");
+  const [aiProvider, setAiProvider] = useState("claude"); // which button was used to polish
   const [expandedSession, setExpandedSession] = useState(null);
   const [micState, setMicState]     = useState(() => getMicPermissionState()); // null|granted|denied|unavailable
   const [requesting, setRequesting] = useState(false); // true only during the one-time prompt
@@ -2618,11 +2704,19 @@ function SpeechPage({ store, onSave, showToast }) {
         }
       };
       sr.onend = () => {
-        // Mobile browsers stop recognition after pauses; auto-restart while the
-        // user is still recording so the transcript keeps building.
-        if (recActiveRef.current) {
-          try { sr.start(); } catch { /* will retry on next onend */ }
-        }
+        // Mobile browsers stop recognition after pauses (often every few
+        // seconds); auto-restart while the user is still recording so the
+        // transcript keeps building across the whole session. Restarting
+        // instantly can throw InvalidStateError on some Android browsers, so
+        // give mobile a brief beat before retrying, with one follow-up retry
+        // if the first attempt still fails.
+        if (!recActiveRef.current) return;
+        const restart = () => {
+          if (!recActiveRef.current) return;
+          try { sr.start(); }
+          catch { setTimeout(() => { if (recActiveRef.current) { try { sr.start(); } catch {} } }, 300); }
+        };
+        IS_MOBILE ? setTimeout(restart, 150) : restart();
       };
       // Start recognition FIRST so it claims the mic, THEN start the waveform.
       try { sr.start(); startAudio(); }
@@ -2641,11 +2735,13 @@ function SpeechPage({ store, onSave, showToast }) {
     setPhase("recorded");
   }
 
-  async function analyze() {
+  async function analyze(provider = "claude") {
     if (!transcript.trim()) { showToast("No transcript to analyze","error"); return; }
+    const prov = AI_PROVIDERS[provider] || AI_PROVIDERS.claude;
+    setAiProvider(provider);
     setPhase("polishing");
     try {
-      const raw = await claude(`You are an expert leadership communication coach. Take the speaker's OWN raw transcript and rewrite it into polished, leadership-ready conversational sentences.
+      const raw = await prov.call(`You are an expert leadership communication coach. Take the speaker's OWN raw transcript and rewrite it into polished, leadership-ready conversational sentences.
 
 CRITICAL RULES for "polished":
 - Rewrite ONLY what the speaker actually said. Do NOT invent new points, facts, or examples that aren't in their words.
@@ -2671,7 +2767,7 @@ Return ONLY valid JSON:
   "improvements": ["improvement 1", "improvement 2"],
   "fillerWordsFound": ["um", "uh", etc found in the original]
 }
-Raw transcript: "${transcript.slice(0,1200)}"`, 2200);
+Raw transcript: "${transcript.slice(0,6000)}"`, 4000);
       // Robust parse: extract the JSON object even if the model adds stray text.
       let d;
       try { d = JSON.parse(raw); }
@@ -2683,23 +2779,30 @@ Raw transcript: "${transcript.slice(0,1200)}"`, 2200);
       const polishedText = (d.polished || "").trim();
       if (!polishedText) throw new Error("no polished text");
       setPolished(polishedText); setResult(d); setPhase("analyzed");
-      autoSave({ ...d, polished:polishedText });
-    } catch {
+      autoSave({ ...d, polished:polishedText }, provider);
+    } catch (err) {
+      // User cancelled the API-key prompt for ChatGPT/Gemini — back out
+      // quietly to "recorded" instead of burning a fallback save.
+      if (err?.message === "no-key") { setPhase("recorded"); return; }
+
       // The structured JSON call failed. Before giving up on AI, try a simpler
       // plain-text polish call (no JSON to parse) so the transcript is STILL
       // rewritten by AI into a leadership style.
       try {
-        const polishedAI = await claude(`Rewrite the following speech transcript into polished, confident, leadership-ready conversational sentences. Keep the speaker's own meaning, ideas, and first-person voice — just fix grammar, remove filler words (um, uh, like, you know), and improve flow. Do NOT add new points or generic advice. Return ONLY the rewritten speech text, nothing else.
+        const polishedAI = await prov.call(`Rewrite the following speech transcript into polished, confident, leadership-ready conversational sentences. Keep the speaker's own meaning, ideas, and first-person voice — just fix grammar, remove filler words (um, uh, like, you know), and improve flow. Do NOT add new points or generic advice. Return ONLY the rewritten speech text, nothing else.
 
-Transcript: "${transcript.slice(0,1200)}"`, 1500);
+Transcript: "${transcript.slice(0,6000)}"`, 3000);
         const polishedText = (polishedAI || "").replace(/^["'\s]+|["'\s]+$/g,"").trim();
         if (!polishedText) throw new Error("empty");
         const title = (transcript.trim().split(/\s+/).slice(0,5).join(" ") || "Speech session");
         const r = { title, clarity:78,tone:82,confidence:75,structure:78,overallScore:78,feedback:"Clear delivery with room to tighten structure. Keep reducing filler words to sound even more authoritative.",keyStrengths:["Authentic voice","Clear intent"],improvements:["Tighten structure","Reduce filler words"],fillerWordsFound:[] };
         setPolished(polishedText); setResult(r); setPhase("analyzed");
-        autoSave({ ...r, polished:polishedText });
+        autoSave({ ...r, polished:polishedText }, provider);
         return;
-      } catch { /* fall through to offline cleanup */ }
+      } catch (err2) {
+        if (err2?.message === "no-key") { setPhase("recorded"); return; }
+        /* fall through to offline cleanup */
+      }
 
       // Offline fallback: do a light local cleanup of the user's own words so the
       // polished panel still reflects what they said (never generic filler text).
@@ -2711,13 +2814,13 @@ Transcript: "${transcript.slice(0,1200)}"`, 1500);
       const fallbackTitle = (transcript.trim().split(/\s+/).slice(0,5).join(" ") || "Speech session") + "…";
       const fbResult = { title:fallbackTitle, clarity:74,tone:80,confidence:70,structure:77,overallScore:75,feedback:"Focus on clear structure: opening, evidence, conclusion. Minimize filler words to project confidence.",keyStrengths:["Clear intent","Authentic voice"],improvements:["Reduce filler words","Add concrete examples"],fillerWordsFound:[] };
       setPolished(cleaned); setResult(fbResult); setPhase("analyzed");
-      autoSave({ ...fbResult, polished:cleaned });
-      showToast("Saved with offline polishing — AI unavailable","error");
+      autoSave({ ...fbResult, polished:cleaned }, provider);
+      showToast(`Saved with offline polishing — ${prov.label} unavailable`,"error");
     }
   }
 
   // Auto-save every completed session with an AI title + date & time stamp.
-  function autoSave(d) {
+  function autoSave(d, provider = "claude") {
     const now = new Date();
     const entry = {
       id: Date.now(),
@@ -2726,11 +2829,12 @@ Transcript: "${transcript.slice(0,1200)}"`, 1500);
       polished: d.polished || "",
       result: d,
       duration: time,
+      polishedBy: (AI_PROVIDERS[provider] || AI_PROVIDERS.claude).label,
       savedAt: now.toLocaleDateString(),
       savedAtTime: now.toLocaleString("en-US",{ month:"short", day:"numeric", year:"numeric", hour:"numeric", minute:"2-digit" }),
     };
     onSave("savedSpeeches", [entry, ...(store.savedSpeeches||[])]);
-    showToast("Session auto-saved 🎙");
+    showToast(`Session auto-saved 🎙 (polished by ${entry.polishedBy})`);
   }
 
   function delSession(id) {
@@ -2788,19 +2892,26 @@ Transcript: "${transcript.slice(0,1200)}"`, 1500);
             <SLbl color={P.coralD}>Live Transcript {phase==="recorded"?"— Edit if needed before analyzing":""}</SLbl>
             <textarea value={transcript} onChange={e=>setTranscript(e.target.value)} rows={5} style={{ width:"100%",padding:"12px 14px",border:`1.5px solid ${P.g200}`,borderRadius:10,fontSize:13,fontFamily:"inherit",resize:"vertical",outline:"none",lineHeight:1.65,boxSizing:"border-box",background:P.g50,color:P.g800 }}/>
             <div style={{ marginTop:12,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap" }}>
-              {phase==="recorded" && (
-                <>
-                  <GBtn onClick={analyze} grad={P.gradCoral}>✨ Polish &amp; Analyze</GBtn>
-                  <span className="ls-hide-sm" style={{ fontSize:12,color:P.g400 }}>AI will correct, polish, and score your speech</span>
-                </>
-              )}
               {!recording && (transcript || phase!=="idle") && (
                 <Ghost onClick={clearAll} color={P.red} size="sm">🗑 Clear</Ghost>
               )}
             </div>
+            {phase==="recorded" && (
+              <div style={{ marginTop:12 }}>
+                <div style={{ fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:".07em",color:P.g400,marginBottom:8 }}>✨ Polish &amp; Analyze with</div>
+                <div style={{ display:"flex",gap:8,flexWrap:"wrap" }}>
+                  {Object.entries(AI_PROVIDERS).map(([key,p]) => (
+                    <GBtn key={key} onClick={()=>analyze(key)} grad={p.grad}>
+                      {p.label}{p.needsKey ? " 🔑" : ""}
+                    </GBtn>
+                  ))}
+                </div>
+                <div style={{ fontSize:11,color:P.g400,marginTop:8 }}>Claude works instantly. ChatGPT and Gemini 🔑 will ask for your own API key the first time (used only in this browser tab, never stored).</div>
+              </div>
+            )}
             {phase==="polishing" && (
               <div style={{ display:"flex",alignItems:"center",gap:10,marginTop:12,padding:"14px 16px",background:P.coral10,borderRadius:10 }}>
-                <Spin color={P.coral}/><span style={{ fontSize:13,color:P.coralD,fontWeight:500 }}>Polishing transcript and analyzing leadership quality…</span>
+                <Spin color={P.coral}/><span style={{ fontSize:13,color:P.coralD,fontWeight:500 }}>Polishing with {(AI_PROVIDERS[aiProvider]||AI_PROVIDERS.claude).label} and analyzing leadership quality…</span>
               </div>
             )}
           </div>
@@ -2821,7 +2932,7 @@ Transcript: "${transcript.slice(0,1200)}"`, 1500);
                 </div>
               </div>
               <div style={{ flex:1 }}>
-                <div style={{ fontSize:16,fontWeight:700,...gText(P.gradCoral),marginBottom:6 }}>Overall Leadership Score</div>
+                <div style={{ fontSize:16,fontWeight:700,...gText(P.gradCoral),marginBottom:6 }}>Overall Leadership Score <span style={{ fontSize:11,fontWeight:600,color:P.g400 }}>· polished by {(AI_PROVIDERS[aiProvider]||AI_PROVIDERS.claude).label}</span></div>
                 <div style={{ fontSize:13,color:P.g600,lineHeight:1.65 }}>{result.feedback}</div>
                 {result.fillerWordsFound?.length>0 && <div style={{ fontSize:12,color:P.amberD,marginTop:8 }}>⚠️ Filler words detected: {result.fillerWordsFound.slice(0,6).map(w=>`"${w}"`).join(", ")}</div>}
               </div>
